@@ -105,7 +105,11 @@ python main.py render --experiment-name my-agent --output demo.gif
 ### Analyze with PCA
 
 ```bash
-python main.py analyze --experiment-name my-agent
+# Collect episode data for analysis
+python main.py analyze collect --experiment-name my-agent --num-episodes 100
+
+# Generate PCA plots from collected data
+python main.py analyze plot --experiment-name my-agent
 ```
 
 ## Key Files
@@ -167,38 +171,3 @@ q_values, new_state = dqn(obs, state)
 action, new_state = dqn.select_action(obs, state, epsilon=0.1)
 ```
 
-## Testing
-
-```bash
-# Test individual modules
-python mpn_module.py
-python mpn_dqn.py
-
-# Run training
-python main.py train --num-episodes 100
-```
-
-## Reference
-
-If you use this code, please cite:
-
-```bibtex
-@article{aitken_neural_2023,
-    title = {Neural population dynamics of computing with synaptic modulations},
-    volume = {12},
-    issn = {2050-084X},
-    url = {https://elifesciences.org/articles/83035},
-    doi = {10.7554/eLife.83035},
-    abstract = {In addition to long-timescale rewiring, synapses in the brain are subject to significant modulation that occurs at faster timescales that endow the brain with additional means of processing information. Despite this, models of the brain like recurrent neural networks (RNNs) often have their weights frozen after training, relying on an internal state stored in neuronal activity to hold task-relevant information. In this work, we study the computational potential and resulting dynamics of a network that relies solely on synapse modulation during inference to process task-relevant information, the multi-plasticity network (MPN). Since the MPN has no recurrent connections, this allows us to study the computational capabilities and dynamical behavior contributed by synapses modulations alone. The generality of the MPN allows for our results to apply to synaptic modulation mechanisms ranging from short-term synaptic plasticity (STSP) to slower modulations such as spike-time dependent plasticity (STDP). We thoroughly examine the neural population dynamics of the MPN trained on integration-based tasks and compare it to known RNN dynamics, finding the two to have fundamentally different attractor structure. We find said differences in dynamics allow the MPN to outperform its RNN counterparts on several neuroscience-relevant tests. Training the MPN across a battery of neuroscience tasks, we find its computational capabilities in such settings is comparable to networks that compute with recurrent connections. Altogether, we believe this work demonstrates the computational possibilities of computing with synaptic modulations and highlights important motifs of these computations so that they can be identified in brain-like systems.},
-    pages = {e83035},
-    journaltitle = {eLife},
-    author = {Aitken, Kyle and Mihalas, Stefan},
-    urldate = {2025-02-01},
-    date = {2023-02-23},
-    langid = {english},
-}
-```
-
-## License
-
-See parent directory for licensing information.
