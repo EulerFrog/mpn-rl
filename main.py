@@ -40,7 +40,7 @@ from mpn_dqn import MPNDQN
 from model_utils import (ExperimentManager, save_checkpoint, load_checkpoint_for_eval,
                          load_checkpoint_for_resume, ReplayBuffer, compute_td_loss)
 from visualize import TrainingVisualizer
-from render_utils import render_episode_to_gif, PeriodicGIFRenderer
+from render_utils import render_episode_to_gif
 
 # Gym import
 import gymnasium as gym
@@ -96,7 +96,7 @@ def train(args):
 
     # Create environment
     env = gym.make(args.env_name,
-                   render_mode='rgb_array' if args.render_freq_mins > 0 else None,
+                   render_mode=None,
                    max_episode_steps=args.max_episode_steps)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
@@ -134,19 +134,6 @@ def train(args):
 
     # Visualization
     viz = TrainingVisualizer() if args.plot_training else None
-
-    # GIF renderer
-    gif_renderer = None
-    if args.render_freq_mins > 0:
-        gif_renderer = PeriodicGIFRenderer(
-            online_dqn, env,
-            save_dir=exp_manager.video_dir,
-            interval_mins=args.render_freq_mins,
-            max_steps=5000,
-            fps=30,
-            epsilon=0.0  # Greedy for rendering
-        )
-        print(f"GIF rendering enabled (every {args.render_freq_mins} minutes)\n")
 
     # Training loop
     epsilon = args.epsilon_start
@@ -231,10 +218,6 @@ def train(args):
             viz.update(episode=episode, episode_reward=episode_reward,
                       episode_length=episode_length, loss=avg_loss, epsilon=epsilon)
 
-        # Render GIF periodically
-        if gif_renderer is not None:
-            gif_renderer.maybe_render(episode)
-
         # Checkpoint
         if episode % args.checkpoint_freq == 0 and episode > 0:
             # Calculate average reward over last window
@@ -302,7 +285,7 @@ def resume_training(args):
 
     # Create environment
     env = gym.make(config['env_name'],
-                   render_mode='rgb_array' if config.get('render_freq_mins', 0) > 0 else None,
+                   render_mode=None,
                    max_episode_steps=max_episode_steps)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
@@ -863,7 +846,6 @@ def main():
     train_parser.add_argument('--target-update-freq', type=int, default=10, help='Target network update frequency (episodes)')
     train_parser.add_argument('--checkpoint-freq', type=int, default=50, help='Checkpoint save frequency (episodes)')
     train_parser.add_argument('--print-freq', type=int, default=10, help='Print frequency (episodes)')
-    train_parser.add_argument('--render-freq-mins', type=float, default=0, help='GIF render frequency (minutes, 0=disabled)')
     train_parser.add_argument('--plot-training', action='store_true', help='Plot training curves')
     train_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
 
