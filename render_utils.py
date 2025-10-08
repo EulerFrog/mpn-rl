@@ -180,13 +180,8 @@ def render_episode_to_gif(
         m_matrices.append(M)
         actions_trajectory.append(action)
 
-        step_result = env.step(action)
-        if len(step_result) == 5:
-            next_obs, reward, terminated, truncated, _ = step_result
-            done = terminated or truncated
-        else:
-            next_obs, reward, done, _ = step_result
-
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
         obs = torch.FloatTensor(next_obs)
         state = new_state
 
@@ -272,13 +267,8 @@ def render_episode_to_gif(
         frames.append(combined_frame)
 
         # Take step
-        step_result = env.step(action)
-        if len(step_result) == 5:
-            next_obs, reward, terminated, truncated, _ = step_result
-            done = terminated or truncated
-        else:
-            next_obs, reward, done, _ = step_result
-
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
         obs = torch.FloatTensor(next_obs)
         state = new_state
         total_reward += reward

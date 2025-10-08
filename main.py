@@ -101,6 +101,7 @@ def train(args):
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
+    print(f"Algorithm: DQN (Deep Q-Network)")
     print(f"Environment: {args.env_name}")
     print(f"Observation dim: {obs_dim}, Action dim: {action_dim}")
     print(f"Max episode steps: {args.max_episode_steps}")
@@ -164,13 +165,8 @@ def train(args):
                     action = q_values.argmax(dim=1).item()
 
             # Take step
-            step_result = env.step(action)
-            if len(step_result) == 5:
-                next_obs, reward, terminated, truncated, _ = step_result
-                done = terminated or truncated
-            else:
-                next_obs, reward, done, _ = step_result
-
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
             next_obs = torch.FloatTensor(next_obs).to(device)
 
             # Store experience (store on CPU to save GPU memory)
@@ -387,13 +383,8 @@ def evaluate(args):
                 q_values, state = dqn(obs.unsqueeze(0), state)
                 action = q_values.argmax(dim=1).item()
 
-            step_result = env.step(action)
-            if len(step_result) == 5:
-                obs, reward, terminated, truncated, _ = step_result
-                done = terminated or truncated
-            else:
-                obs, reward, done, _ = step_result
-
+            obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
             obs = torch.FloatTensor(obs).to(device)
             episode_reward += reward
             episode_length += 1

@@ -398,12 +398,8 @@ def collect_episodes(dqn, env, n_episodes: int, device: torch.device,
             collector.record_step(hidden, new_state, obs, action, 0)
 
             # Take step
-            step_result = env.step(action)
-            if len(step_result) == 5:
-                next_obs, reward, terminated, truncated, _ = step_result
-                done = terminated or truncated
-            else:
-                next_obs, reward, done, _ = step_result
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
 
             # Update for next iteration
             obs = torch.FloatTensor(next_obs).to(device)

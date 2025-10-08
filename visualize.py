@@ -140,6 +140,7 @@ class MMatrixVisualizer:
         """
         Record state at current timestep.
 
+                optimizer.zero_grad()
         Args:
             M: M matrix state (batch_size, hidden_dim, obs_dim)
             obs: Observation (batch_size, obs_dim)
@@ -296,12 +297,8 @@ def visualize_episode(dqn, env, max_steps: int = 500,
         viz.record_step(new_state, obs.unsqueeze(0), q_values, action)
 
         # Take step
-        step_result = env.step(action)
-        if len(step_result) == 5:
-            next_obs, reward, terminated, truncated, _ = step_result
-            done = terminated or truncated
-        else:
-            next_obs, reward, done, _ = step_result
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
 
         # Record frame if saving animation
         if save_animation:
