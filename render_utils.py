@@ -18,6 +18,7 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.colors import Normalize
 from PIL import Image
 import imageio
 
@@ -48,16 +49,29 @@ def create_m_matrix_frame(M: np.ndarray, figsize=(4, 3), dpi=100, vmin=None, vma
     """
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
 
-    # Plot M matrix with consistent scale
+    # Plot M matrix with consistent scale and proper axis extent
     if vmin is None or vmax is None:
         abs_max = np.abs(M).max() if np.abs(M).max() > 0 else 1.0
         vmin = -abs_max if vmin is None else vmin
         vmax = abs_max if vmax is None else vmax
-    im = ax.imshow(M, cmap='RdBu_r', aspect='auto', vmin=vmin, vmax=vmax)
 
+    # Create explicit normalization for consistent coloring across frames
+    norm = Normalize(vmin=vmin, vmax=vmax)
+
+    # Set extent so x-axis goes from 0 to n_inputs (e.g., 0 to 4)
+    n_hidden, n_inputs = M.shape
+    extent = [0, n_inputs, n_hidden, 0]  # [left, right, bottom, top]
+
+    im = ax.imshow(M, cmap='RdBu_r', aspect='auto', norm=norm, extent=extent)
+
+    # Set axis labels and ticks
     ax.set_xlabel('Input Dimension', fontsize=8)
     ax.set_ylabel('Hidden Dimension', fontsize=8)
     ax.set_title('M Matrix (Synaptic Modulation)', fontsize=10)
+
+    # Set x-axis ticks to show integer dimensions
+    ax.set_xticks(range(n_inputs + 1))
+
     ax.tick_params(labelsize=6)
 
     # Colorbar
@@ -136,7 +150,17 @@ def render_episode_to_gif(
     """
     # First pass: collect all M matrices to compute consistent scale
     print("First pass: computing M matrix scale...")
-    obs, _ = env.reset() if isinstance(env.reset(), tuple) else (env.reset(), {})
+
+    # Get initial seed to reset to same state later
+    reset_result = env.reset()
+    if isinstance(reset_result, tuple):
+        obs, info = reset_result
+        # Try to get seed from info if available
+        seed = info.get('seed', None)
+    else:
+        obs = reset_result
+        seed = None
+
     obs = torch.FloatTensor(obs)
     state = dqn.init_state(batch_size=1)
 
@@ -180,7 +204,17 @@ def render_episode_to_gif(
     frames = []
     total_reward = 0
 
-    obs, _ = env.reset() if isinstance(env.reset(), tuple) else (env.reset(), {})
+    # Reset to same initial state if possible
+    if seed is not None:
+        reset_result = env.reset(seed=seed)
+    else:
+        reset_result = env.reset()
+
+    if isinstance(reset_result, tuple):
+        obs, _ = reset_result
+    else:
+        obs = reset_result
+
     obs = torch.FloatTensor(obs)
     state = dqn.init_state(batch_size=1)
 
@@ -192,12 +226,15 @@ def render_episode_to_gif(
             print("Warning: Environment returned None for render(). Make sure render_mode='rgb_array'")
             break
 
-        # Get action from trajectory (must match first pass)
-        action = actions_trajectory[step] if step < len(actions_trajectory) else 0
-
-        # Get state update
+        # Get state update and compute action (don't use pre-recorded trajectory)
         with torch.no_grad():
             q_values, new_state = dqn(obs.unsqueeze(0), state)
+
+            # Compute action fresh (greedy since epsilon=0.0 by default)
+            if np.random.random() < epsilon:
+                action = env.action_space.sample()
+            else:
+                action = q_values.argmax(dim=1).item()
 
         # Create M matrix visualization with consistent scale
         M = new_state.squeeze(0).cpu().numpy()

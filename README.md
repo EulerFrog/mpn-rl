@@ -62,11 +62,11 @@ Where:
   - Integrates with TorchRL's training infrastructure
   - Requires: `pip install torchrl tensordict`
 
-- **`example_usage.py`**: Training examples
-  - Basic DQN training loop
-  - Experience replay buffer
-  - Training on Gym/Gymnasium environments
-  - Comparison with standard (non-recurrent) DQN
+- **`model_utils.py`**: Training utilities and experiment management
+  - `ReplayBuffer`: Experience replay buffer for DQN
+  - `compute_td_loss`: TD loss computation for Double DQN
+  - `ExperimentManager`: Experiment directory and checkpoint management
+  - Configuration and training history tracking
 
 - **`visualize.py`**: Visualization tools
   - `TrainingVisualizer`: Plot training metrics (rewards, losses, epsilon)
@@ -292,17 +292,25 @@ action, new_state = dqn.select_action(obs, state, epsilon=0.1)
 
 ### Training on Gym
 
-```python
-from example_usage import train_mpn_dqn
+Use the CLI for training (see Command-Line Interface section above):
 
-# Train on CartPole
-mpn_dqn, rewards = train_mpn_dqn(
-    env_name='CartPole-v1',
-    num_episodes=200,
-    hidden_dim=32,
-    eta=0.05,
-    lambda_decay=0.9
-)
+```bash
+# Train with custom hyperparameters
+python main.py train --experiment-name my-agent \
+    --num-episodes 200 \
+    --hidden-dim 32 \
+    --eta 0.05 \
+    --lambda-decay 0.9
+```
+
+For programmatic training, you can import the training components:
+
+```python
+from model_utils import ReplayBuffer, compute_td_loss
+from mpn_dqn import MPNDQN
+import gymnasium as gym
+
+# See main.py train() function for full training loop example
 ```
 
 ### TorchRL Integration
@@ -387,8 +395,8 @@ python3 mpn_dqn.py
 # Test TorchRL wrapper
 python3 mpn_torchrl.py
 
-# Run training example (requires gymnasium)
-python3 example_usage.py
+# Run training via CLI (requires gymnasium)
+python3 main.py train --num-episodes 100
 ```
 
 ## Comparison: MPN-DQN vs Standard DQN
@@ -423,10 +431,9 @@ mpn_rl/
 ├── mpn_dqn.py               # DQN with MPN recurrent layer
 ├── mpn_torchrl.py           # TorchRL wrappers
 ├── pca_analysis.py          # PCA analysis tools
-├── model_utils.py           # Save/load and experiment management
+├── model_utils.py           # Training utils and experiment management
 ├── render_utils.py          # GIF rendering with CartPole + M matrix
 ├── visualize.py             # Visualization tools
-├── example_usage.py         # Training examples (programmatic)
 └── ai_docs/                 # AI-generated documentation
     ├── YYYY-MM-DD/         # Session-specific logs
     ├── IMPLEMENTATION_REFERENCE.md

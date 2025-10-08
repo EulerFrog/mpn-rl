@@ -37,7 +37,8 @@ from pathlib import Path
 
 # MPN-DQN imports
 from mpn_dqn import MPNDQN
-from model_utils import ExperimentManager, save_checkpoint, load_checkpoint_for_eval, load_checkpoint_for_resume
+from model_utils import (ExperimentManager, save_checkpoint, load_checkpoint_for_eval,
+                         load_checkpoint_for_resume, ReplayBuffer, compute_td_loss)
 from visualize import TrainingVisualizer
 from render_utils import render_episode_to_gif, PeriodicGIFRenderer
 
@@ -94,12 +95,15 @@ def train(args):
     print()
 
     # Create environment
-    env = gym.make(args.env_name, render_mode='rgb_array' if args.render_freq_mins > 0 else None)
+    env = gym.make(args.env_name,
+                   render_mode='rgb_array' if args.render_freq_mins > 0 else None,
+                   max_episode_steps=args.max_episode_steps)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
     print(f"Environment: {args.env_name}")
     print(f"Observation dim: {obs_dim}, Action dim: {action_dim}")
+    print(f"Max episode steps: {args.max_episode_steps}")
     print(f"MPN: hidden_dim={args.hidden_dim}, eta={args.eta}, lambda={args.lambda_decay}\n")
 
     # Create networks
@@ -126,7 +130,6 @@ def train(args):
     optimizer = torch.optim.Adam(online_dqn.parameters(), lr=args.learning_rate)
 
     # Replay buffer
-    from example_usage import ReplayBuffer, compute_td_loss
     replay_buffer = ReplayBuffer(capacity=args.buffer_size)
 
     # Visualization
@@ -139,7 +142,7 @@ def train(args):
             online_dqn, env,
             save_dir=exp_manager.video_dir,
             interval_mins=args.render_freq_mins,
-            max_steps=500,
+            max_steps=5000,
             fps=30,
             epsilon=0.0  # Greedy for rendering
         )
@@ -294,8 +297,13 @@ def resume_training(args):
     print(f"Loaded experiment: {exp_manager.experiment_name}")
     print(f"Original config: {config}\n")
 
+    # Use max_episode_steps from args if provided, otherwise from config
+    max_episode_steps = args.max_episode_steps if args.max_episode_steps is not None else config.get('max_episode_steps', 2000)
+
     # Create environment
-    env = gym.make(config['env_name'], render_mode='rgb_array' if config.get('render_freq_mins', 0) > 0 else None)
+    env = gym.make(config['env_name'],
+                   render_mode='rgb_array' if config.get('render_freq_mins', 0) > 0 else None,
+                   max_episode_steps=max_episode_steps)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
@@ -351,7 +359,8 @@ def evaluate(args):
 
     # Create environment
     render_mode = 'rgb_array' if args.render else None
-    env = gym.make(config['env_name'], render_mode=render_mode)
+    env = gym.make(config['env_name'], render_mode=render_mode,
+                   max_episode_steps=args.max_episode_steps)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
@@ -373,7 +382,11 @@ def evaluate(args):
     checkpoint_name = args.checkpoint if args.checkpoint else "best_model.pt"
     load_checkpoint_for_eval(exp_manager, dqn, checkpoint_name, device=str(device))
 
+    # Set to eval mode
+    dqn.eval()
+
     print(f"Loaded checkpoint: {checkpoint_name}")
+    print(f"Max episode steps: {args.max_episode_steps}")
     print(f"Evaluating for {args.num_eval_episodes} episodes\n")
 
     # Evaluate
@@ -428,8 +441,15 @@ def render_to_gif(args):
     exp_manager = ExperimentManager(args.experiment_name)
     config = exp_manager.load_config()
 
+    # Determine output path (default to videos directory if not specified)
+    if args.output is None:
+        output_path = exp_manager.video_dir / "render.gif"
+    else:
+        output_path = args.output
+
     # Create environment
-    env = gym.make(config['env_name'], render_mode='rgb_array')
+    env = gym.make(config['env_name'], render_mode='rgb_array',
+                   max_episode_steps=args.max_episode_steps)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
@@ -452,16 +472,227 @@ def render_to_gif(args):
     checkpoint_name = args.checkpoint if args.checkpoint else "best_model.pt"
     load_checkpoint_for_eval(exp_manager, dqn, checkpoint_name, device='cpu')
 
+    # Set to eval mode
+    dqn.eval()
+
     print(f"Loaded checkpoint: {checkpoint_name}")
-    print(f"Rendering to: {args.output}\n")
+    print(f"Max episode steps: {args.max_episode_steps}")
+    print(f"Rendering to: {output_path}\n")
 
     # Render
-    reward = render_episode_to_gif(dqn, env, args.output, max_steps=args.max_steps, fps=args.fps)
+    reward = render_episode_to_gif(dqn, env, str(output_path), max_steps=args.max_episode_steps, fps=args.fps)
 
     env.close()
 
     print(f"\nRendering completed! Episode reward: {reward:.2f}")
-    print(f"GIF saved to: {args.output}")
+    print(f"GIF saved to: {output_path}")
+
+
+def analyze_collect(args):
+    """Collect episode data and save to npz."""
+    print("="*60)
+    print("Collecting MPN-DQN Episode Data")
+    print("="*60)
+
+    # Load experiment
+    exp_manager = ExperimentManager(args.experiment_name)
+    config = exp_manager.load_config()
+
+    # Create analysis output directory
+    analysis_dir = exp_manager.exp_dir / "analysis"
+    analysis_dir.mkdir(exist_ok=True)
+
+    # Create environment
+    env = gym.make(config['env_name'], render_mode='rgb_array',
+                   max_episode_steps=args.max_episode_steps)
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+
+    # Setup device
+    device = get_device(args.device)
+    print()
+
+    # Create model
+    dqn = MPNDQN(
+        obs_dim=obs_dim,
+        hidden_dim=config['hidden_dim'],
+        action_dim=action_dim,
+        eta=config['eta'],
+        lambda_decay=config['lambda_decay'],
+        activation=config.get('activation', 'tanh')
+    ).to(device)
+
+    # Load checkpoint
+    checkpoint_name = args.checkpoint if args.checkpoint else "best_model.pt"
+    load_checkpoint_for_eval(exp_manager, dqn, checkpoint_name, device=str(device))
+
+    # Set to eval mode
+    dqn.eval()
+
+    print(f"Loaded checkpoint: {checkpoint_name}")
+    print(f"Environment: {config['env_name']}")
+    print(f"Max episode steps: {args.max_episode_steps}")
+    print(f"Collecting {args.num_episodes} episodes\n")
+
+    # Import PCA analysis tools
+    from pca_analysis import collect_episodes, save_collected_data
+
+    # Collect episodes
+    print("Collecting episodes...")
+    collector = collect_episodes(dqn, env, args.num_episodes, device,
+                                 epsilon=0.0, max_steps=args.max_episode_steps)
+
+    data = collector.get_data()
+    print(f"\nCollected {len(data['hidden'])} episodes")
+    print(f"Episode lengths - Mean: {np.mean(data['lengths']):.1f}, "
+          f"Min: {np.min(data['lengths'])}, Max: {np.max(data['lengths'])}\n")
+
+    # Save to npz
+    save_path = analysis_dir / "pca_data.npz"
+    save_collected_data(collector, str(save_path))
+
+    env.close()
+
+    print("\n" + "="*60)
+    print("Data collection completed!")
+    print(f"Saved to: {save_path}")
+    print("="*60)
+
+
+def analyze_plot(args):
+    """Load npz data and generate PCA plots."""
+    print("="*60)
+    print("Plotting MPN-DQN PCA Analysis")
+    print("="*60)
+
+    # Load experiment
+    exp_manager = ExperimentManager(args.experiment_name)
+
+    # Analysis directory
+    analysis_dir = exp_manager.exp_dir / "analysis"
+    if not analysis_dir.exists():
+        print(f"Error: Analysis directory not found: {analysis_dir}")
+        print("Run 'analyze collect' first to collect episode data.")
+        sys.exit(1)
+
+    # Load npz data
+    npz_path = analysis_dir / "pca_data.npz"
+    if not npz_path.exists():
+        print(f"Error: Data file not found: {npz_path}")
+        print("Run 'analyze collect' first to collect episode data.")
+        sys.exit(1)
+
+    print(f"Loading data from: {npz_path}\n")
+
+    from pca_analysis import load_collected_data, MPNPCAAnalyzer, plot_trajectories_2d
+
+    # Load data
+    data = load_collected_data(str(npz_path))
+
+    # Prepare pooled data for PCA
+    hidden_pooled = data['hidden_states']
+    M_pooled = data['M_matrices']
+    obs_pooled = data['observations']
+    episode_lengths = data['episode_lengths']
+
+    # Flatten M matrices for PCA
+    M_flat_pooled = M_pooled.reshape(M_pooled.shape[0], -1)
+
+    print(f"\nTotal timesteps: {hidden_pooled.shape[0]}")
+    print(f"Episode lengths - Mean: {np.mean(episode_lengths):.1f}, "
+          f"Min: {np.min(episode_lengths)}, Max: {np.max(episode_lengths)}")
+
+    # Perform PCA analysis
+    print("\n" + "-"*60)
+    print("Performing PCA Analysis...")
+    print("-"*60)
+
+    analyzer = MPNPCAAnalyzer()
+
+    # Determine number of components
+    hidden_dim = hidden_pooled.shape[1]
+    M_dim = M_flat_pooled.shape[1]
+    n_components_hidden = min(args.n_components, hidden_dim)
+    n_components_M = min(args.n_components, M_dim)
+
+    # Fit PCA on hidden states
+    if args.analyze_hidden:
+        analyzer.fit_hidden_pca(hidden_pooled, n_components=n_components_hidden)
+
+    # Fit PCA on M matrices
+    if args.analyze_M:
+        analyzer.fit_M_pca(M_flat_pooled, n_components=n_components_M)
+
+    # Plot variance explained
+    if args.plot_variance and (args.analyze_hidden or args.analyze_M):
+        print("\nPlotting explained variance...")
+        variance_path = analysis_dir / "pca_variance.png"
+        analyzer.plot_variance_explained(save_path=str(variance_path),
+                                        max_components=args.n_components)
+
+    # Plot trajectories
+    if args.plot_trajectories:
+        print("Plotting trajectories...")
+
+        # Transform pooled data to PC space
+        if args.analyze_hidden:
+            hidden_pcs_pooled = analyzer.transform_hidden(hidden_pooled)
+        if args.analyze_M:
+            M_pcs_pooled = analyzer.transform_M(M_flat_pooled)
+
+        # Split pooled data back into episodes using episode_lengths
+        def split_by_episodes(pooled_data, episode_lengths):
+            """Split pooled data into list of episode arrays."""
+            episodes = []
+            start_idx = 0
+            for length in episode_lengths:
+                episodes.append(pooled_data[start_idx:start_idx + length])
+                start_idx += length
+            return episodes
+
+        # Get colors based on feature (e.g., cart position)
+        colors_pooled = obs_pooled[:, args.color_feature]
+        colors_list = split_by_episodes(colors_pooled, episode_lengths)
+
+        # Feature names for CartPole
+        feature_names = ['Cart Position', 'Cart Velocity', 'Pole Angle', 'Pole Angular Velocity']
+        feature_filename = ['cart_position', 'cart_velocity', 'pole_angle', 'pole_angular_velocity']
+
+        color_label = feature_names[args.color_feature] if args.color_feature < 4 else f"Feature {args.color_feature}"
+        filename_suffix = feature_filename[args.color_feature] if args.color_feature < 4 else f"feature_{args.color_feature}"
+
+        # Hidden state trajectories
+        if args.analyze_hidden:
+            print("  - Hidden state trajectories...")
+            hidden_pcs_list = split_by_episodes(hidden_pcs_pooled, episode_lengths)
+
+            traj_path = analysis_dir / f"trajectories_hidden_{filename_suffix}.png"
+            plot_trajectories_2d(
+                hidden_pcs_list,
+                colors_list,
+                save_path=str(traj_path),
+                title="Hidden State Trajectories in PC Space",
+                color_label=color_label
+            )
+
+        # M matrix trajectories
+        if args.analyze_M:
+            print("  - M matrix trajectories...")
+            M_pcs_list = split_by_episodes(M_pcs_pooled, episode_lengths)
+
+            traj_path = analysis_dir / f"trajectories_M_{filename_suffix}.png"
+            plot_trajectories_2d(
+                M_pcs_list,
+                colors_list,
+                save_path=str(traj_path),
+                title="M Matrix Trajectories in PC Space",
+                color_label=color_label
+            )
+
+    print("\n" + "="*60)
+    print("Analysis completed!")
+    print(f"Results saved to: {analysis_dir}")
+    print("="*60)
 
 
 def analyze_agent(args):
@@ -479,7 +710,8 @@ def analyze_agent(args):
     analysis_dir.mkdir(exist_ok=True)
 
     # Create environment
-    env = gym.make(config['env_name'], render_mode='rgb_array')
+    env = gym.make(config['env_name'], render_mode='rgb_array',
+                   max_episode_steps=args.max_episode_steps)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
@@ -503,6 +735,7 @@ def analyze_agent(args):
 
     print(f"Loaded checkpoint: {checkpoint_name}")
     print(f"Environment: {config['env_name']}")
+    print(f"Max episode steps: {args.max_episode_steps}")
     print(f"Analyzing {args.num_episodes} episodes\n")
 
     # Import PCA analysis tools
@@ -512,7 +745,7 @@ def analyze_agent(args):
     # Collect episodes
     print("Collecting episodes...")
     collector = collect_episodes(dqn, env, args.num_episodes, device,
-                                 epsilon=0.0, max_steps=args.max_steps)
+                                 epsilon=0.0, max_steps=args.max_episode_steps)
 
     data = collector.get_data()
     pooled = collector.get_pooled_data()
@@ -613,6 +846,7 @@ def main():
     train_parser = subparsers.add_parser('train', help='Train a new agent')
     train_parser.add_argument('--experiment-name', type=str, default=None, help='Experiment name (random if not provided)')
     train_parser.add_argument('--env-name', type=str, default='CartPole-v1', help='Gym environment name')
+    train_parser.add_argument('--max-episode-steps', type=int, default=2000, help='Maximum steps per episode (default: 2000)')
     train_parser.add_argument('--num-episodes', type=int, default=500, help='Number of training episodes')
     train_parser.add_argument('--hidden-dim', type=int, default=64, help='MPN hidden dimension')
     train_parser.add_argument('--eta', type=float, default=0.05, help='Hebbian learning rate')
@@ -637,6 +871,7 @@ def main():
     resume_parser = subparsers.add_parser('resume', help='Resume training from checkpoint')
     resume_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name to resume')
     resume_parser.add_argument('--num-episodes', type=int, default=500, help='Additional episodes to train')
+    resume_parser.add_argument('--max-episode-steps', type=int, default=None, help='Maximum steps per episode (default: use from config)')
     resume_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
 
     # Eval command
@@ -644,31 +879,40 @@ def main():
     eval_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name')
     eval_parser.add_argument('--num-eval-episodes', type=int, default=10, help='Number of evaluation episodes')
     eval_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load (default: best_model.pt)')
+    eval_parser.add_argument('--max-episode-steps', type=int, default=2000, help='Maximum steps per episode (default: 2000)')
     eval_parser.add_argument('--render', action='store_true', help='Render episodes')
     eval_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
 
     # Render command
     render_parser = subparsers.add_parser('render', help='Render episode to GIF')
     render_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name')
-    render_parser.add_argument('--output', type=str, default='render.gif', help='Output GIF path')
+    render_parser.add_argument('--output', type=str, default=None, help='Output GIF path (default: experiments/{name}/videos/render.gif)')
     render_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load (default: best_model.pt)')
-    render_parser.add_argument('--max-steps', type=int, default=500, help='Max steps per episode')
+    render_parser.add_argument('--max-episode-steps', type=int, default=2000, help='Maximum steps per episode (default: 2000)')
     render_parser.add_argument('--fps', type=int, default=30, help='Frames per second')
 
-    # Analyze command
+    # Analyze command with subcommands
     analyze_parser = subparsers.add_parser('analyze', help='Analyze agent with PCA')
-    analyze_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name')
-    analyze_parser.add_argument('--num-episodes', type=int, default=100, help='Number of episodes to analyze')
-    analyze_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load (default: best_model.pt)')
-    analyze_parser.add_argument('--max-steps', type=int, default=500, help='Max steps per episode')
-    analyze_parser.add_argument('--n-components', type=int, default=100, help='Number of PCA components')
-    analyze_parser.add_argument('--analyze-hidden', action='store_true', default=True, help='Analyze hidden states')
-    analyze_parser.add_argument('--analyze-M', action='store_true', default=True, help='Analyze M matrices')
-    analyze_parser.add_argument('--plot-variance', action='store_true', default=True, help='Plot explained variance')
-    analyze_parser.add_argument('--plot-trajectories', action='store_true', default=True, help='Plot PC trajectories')
-    analyze_parser.add_argument('--color-feature', type=int, default=0,
+    analyze_subparsers = analyze_parser.add_subparsers(dest='analyze_command', help='Analyze subcommand')
+
+    # Analyze collect subcommand
+    analyze_collect_parser = analyze_subparsers.add_parser('collect', help='Collect episode data and save to npz')
+    analyze_collect_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name')
+    analyze_collect_parser.add_argument('--num-episodes', type=int, default=100, help='Number of episodes to collect')
+    analyze_collect_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load (default: best_model.pt)')
+    analyze_collect_parser.add_argument('--max-episode-steps', type=int, default=2000, help='Maximum steps per episode (default: 2000)')
+    analyze_collect_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
+
+    # Analyze plot subcommand
+    analyze_plot_parser = analyze_subparsers.add_parser('plot', help='Load npz data and generate PCA plots')
+    analyze_plot_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name')
+    analyze_plot_parser.add_argument('--n-components', type=int, default=100, help='Number of PCA components')
+    analyze_plot_parser.add_argument('--analyze-hidden', action='store_true', default=True, help='Analyze hidden states')
+    analyze_plot_parser.add_argument('--analyze-M', action='store_true', default=True, help='Analyze M matrices')
+    analyze_plot_parser.add_argument('--plot-variance', action='store_true', default=True, help='Plot explained variance')
+    analyze_plot_parser.add_argument('--plot-trajectories', action='store_true', default=True, help='Plot PC trajectories')
+    analyze_plot_parser.add_argument('--color-feature', type=int, default=0,
                                help='CartPole feature for coloring (0=pos, 1=vel, 2=angle, 3=ang_vel)')
-    analyze_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
 
     args = parser.parse_args()
 
@@ -681,7 +925,12 @@ def main():
     elif args.command == 'render':
         render_to_gif(args)
     elif args.command == 'analyze':
-        analyze_agent(args)
+        if args.analyze_command == 'collect':
+            analyze_collect(args)
+        elif args.analyze_command == 'plot':
+            analyze_plot(args)
+        else:
+            analyze_parser.print_help()
     else:
         parser.print_help()
 

@@ -7,15 +7,91 @@ Handles:
 - Configuration management
 - Training history tracking
 - Random experiment name generation
+- Replay buffer and TD loss computation
 """
 
 import os
 import json
 import torch
+import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, Optional, Any
 import random
 from datetime import datetime
+from collections import deque, namedtuple
+
+
+# Experience tuple for replay buffer
+Experience = namedtuple('Experience', ['obs', 'action', 'reward', 'next_obs', 'done', 'state', 'next_state'])
+
+
+class ReplayBuffer:
+    """Simple replay buffer for DQN."""
+
+    def __init__(self, capacity=10000):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, *args):
+        """Add an experience to the buffer."""
+        self.buffer.append(Experience(*args))
+
+    def sample(self, batch_size):
+        """Sample a batch of experiences."""
+        experiences = random.sample(self.buffer, batch_size)
+
+        # Stack into tensors
+        obs = torch.stack([e.obs for e in experiences])
+        actions = torch.tensor([e.action for e in experiences], dtype=torch.long)
+        rewards = torch.tensor([e.reward for e in experiences], dtype=torch.float32)
+        next_obs = torch.stack([e.next_obs for e in experiences])
+        dones = torch.tensor([e.done for e in experiences], dtype=torch.float32)
+        states = torch.stack([e.state for e in experiences])
+        next_states = torch.stack([e.next_state for e in experiences])
+
+        return obs, actions, rewards, next_obs, dones, states, next_states
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+def compute_td_loss(dqn, target_dqn, batch, gamma=0.99):
+    """
+    Compute TD loss for DQN.
+
+    Uses Double DQN update: Q_target = r + γ * Q_target(s', argmax_a Q_online(s', a))
+
+    Args:
+        dqn: Online DQN network
+        target_dqn: Target DQN network
+        batch: Tuple of (obs, actions, rewards, next_obs, dones, states, next_states)
+        gamma: Discount factor
+
+    Returns:
+        loss: Smooth L1 loss between current Q-values and target Q-values
+    """
+    obs, actions, rewards, next_obs, dones, states, next_states = batch
+
+    # Current Q-values: Q(s, a)
+    current_q, _ = dqn(obs, states)
+    current_q = current_q.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+    # Next Q-values from target network (Double DQN)
+    with torch.no_grad():
+        # Get best actions from online network
+        next_q_online, _ = dqn(next_obs, next_states)
+        next_actions = next_q_online.argmax(dim=1)
+
+        # Evaluate those actions with target network
+        next_q_target, _ = target_dqn(next_obs, next_states)
+        next_q = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
+
+        # TD target: r + γ * Q_target(s', a*)
+        target_q = rewards + gamma * next_q * (1 - dones)
+
+    # Compute loss
+    loss = F.smooth_l1_loss(current_q, target_q)
+
+    return loss
 
 
 # Word lists for random experiment names

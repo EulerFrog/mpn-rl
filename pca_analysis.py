@@ -176,6 +176,72 @@ class HiddenStateCollector:
         }
 
 
+def save_collected_data(collector: HiddenStateCollector, save_path: str):
+    """
+    Save collected episode data to npz file.
+
+    Args:
+        collector: HiddenStateCollector with episode data
+        save_path: Path to save npz file
+
+    File structure:
+        - hidden_states: [total_timesteps, hidden_dim]
+        - M_matrices: [total_timesteps, hidden_dim, input_dim]
+        - observations: [total_timesteps, obs_dim]
+        - episode_lengths: [num_episodes]
+    """
+    pooled = collector.get_pooled_data()
+
+    # Get M matrices in non-flattened form
+    M_matrices_pooled = np.concatenate(collector.episodes_M, axis=0)
+
+    np.savez_compressed(
+        save_path,
+        hidden_states=pooled['hidden'],
+        M_matrices=M_matrices_pooled,
+        observations=pooled['obs'],
+        episode_lengths=np.array(collector.episodes_lengths)
+    )
+
+    print(f"Saved collected data to {save_path}")
+    print(f"  Episodes: {len(collector.episodes_lengths)}")
+    print(f"  Total timesteps: {pooled['hidden'].shape[0]}")
+    print(f"  Hidden dim: {pooled['hidden'].shape[1]}")
+    print(f"  M matrix shape: {M_matrices_pooled.shape}")
+
+
+def load_collected_data(load_path: str) -> Dict:
+    """
+    Load collected episode data from npz file.
+
+    Args:
+        load_path: Path to npz file
+
+    Returns:
+        Dictionary with keys:
+            - hidden_states: [total_timesteps, hidden_dim]
+            - M_matrices: [total_timesteps, hidden_dim, input_dim]
+            - observations: [total_timesteps, obs_dim]
+            - episode_lengths: [num_episodes]
+    """
+    data = np.load(load_path)
+
+    result = {
+        'hidden_states': data['hidden_states'],
+        'M_matrices': data['M_matrices'],
+        'observations': data['observations'],
+        'episode_lengths': data['episode_lengths']
+    }
+
+    print(f"Loaded collected data from {load_path}")
+    print(f"  Episodes: {len(result['episode_lengths'])}")
+    print(f"  Total timesteps: {result['hidden_states'].shape[0]}")
+    print(f"  Hidden dim: {result['hidden_states'].shape[1]}")
+    print(f"  M matrix shape: {result['M_matrices'].shape}")
+
+    return result
+
+
 class MPNPCAAnalyzer:
     """
     Performs PCA analysis on MPN hidden states and M matrices.
@@ -362,7 +428,8 @@ def plot_trajectories_2d(trajectories_pcs: List[np.ndarray],
                          save_path: Optional[str] = None,
                          readout_vectors: Optional[np.ndarray] = None,
                          readout_pcs: Optional[np.ndarray] = None,
-                         color_label: str = "State Feature"):
+                         color_label: str = "State Feature",
+                         n_highlight: int = 2):
     """
     Plot 2D trajectories in principal component space.
 
@@ -375,6 +442,7 @@ def plot_trajectories_2d(trajectories_pcs: List[np.ndarray],
         readout_vectors: Readout weight matrix [n_actions, hidden_dim] (optional)
         readout_pcs: Readout vectors projected to PC space [n_actions, n_components] (optional)
         color_label: Label for colorbar
+        n_highlight: Number of random trajectories to highlight (default: 2)
     """
     n_plots = len(pc_pairs)
     fig, axes = plt.subplots(1, n_plots, figsize=(6*n_plots, 5))
@@ -386,9 +454,17 @@ def plot_trajectories_2d(trajectories_pcs: List[np.ndarray],
     all_colors = np.concatenate(colors)
     vmin, vmax = np.percentile(all_colors, [5, 95])
 
+    # Select random trajectories to highlight
+    n_trajectories = len(trajectories_pcs)
+    highlight_indices = np.random.choice(n_trajectories, size=min(n_highlight, n_trajectories), replace=False)
+    highlight_colors = ['red', 'blue', 'green', 'orange', 'purple', 'cyan']
+
     for ax, (pcx, pcy) in zip(axes, pc_pairs):
-        # Plot all trajectories
-        for traj_pc, traj_colors in zip(trajectories_pcs, colors):
+        # Plot all trajectories (background)
+        for i, (traj_pc, traj_colors) in enumerate(zip(trajectories_pcs, colors)):
+            if i in highlight_indices:
+                continue  # Skip highlighted ones in this pass
+
             # Plot trajectory as line
             ax.plot(traj_pc[:, pcx], traj_pc[:, pcy],
                    alpha=0.3, linewidth=0.5, color='gray', zorder=1)
@@ -398,10 +474,26 @@ def plot_trajectories_2d(trajectories_pcs: List[np.ndarray],
                                c=traj_colors, cmap='viridis',
                                s=10, alpha=0.6, vmin=vmin, vmax=vmax, zorder=2)
 
-            # Mark final point
+        # Plot highlighted trajectories (foreground)
+        for idx, traj_idx in enumerate(highlight_indices):
+            traj_pc = trajectories_pcs[traj_idx]
+            traj_colors = colors[traj_idx]
+            color = highlight_colors[idx % len(highlight_colors)]
+
+            # Thicker line for highlighted trajectory
+            ax.plot(traj_pc[:, pcx], traj_pc[:, pcy],
+                   alpha=0.8, linewidth=2.5, color=color, zorder=4,
+                   label=f'Episode {traj_idx}')
+
+            # Mark start point
+            ax.scatter(traj_pc[0, pcx], traj_pc[0, pcy],
+                      marker='o', s=50, color=color,
+                      edgecolors='black', linewidths=1.5, zorder=5)
+
+            # Mark end point
             ax.scatter(traj_pc[-1, pcx], traj_pc[-1, pcy],
-                      marker='o', s=50, color='red',
-                      edgecolors='black', linewidths=1, zorder=3)
+                      marker='s', s=50, color=color,
+                      edgecolors='black', linewidths=1.5, zorder=5)
 
         # Plot readout vectors if provided
         if readout_pcs is not None:
@@ -417,15 +509,22 @@ def plot_trajectories_2d(trajectories_pcs: List[np.ndarray],
         ax.set_xlabel(f'PC{pcx}', fontsize=12)
         ax.set_ylabel(f'PC{pcy}', fontsize=12)
         ax.grid(True, alpha=0.3)
-        ax.set_aspect('equal', adjustable='datalim')
+        # Use auto aspect ratio for better use of space
+        ax.set_aspect('auto')
 
-    # Add colorbar
-    cbar = plt.colorbar(scatter, ax=axes, orientation='horizontal',
-                       pad=0.1, fraction=0.05, aspect=40)
-    cbar.set_label(color_label, fontsize=11)
+        # Add legend for highlighted trajectories (only on first subplot)
+        if ax == axes[0] and n_highlight > 0:
+            ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
 
     fig.suptitle(title, fontsize=14, fontweight='bold')
-    plt.tight_layout()
+
+    # Apply tight_layout before adding colorbar to get proper spacing
+    plt.tight_layout(rect=[0, 0.08, 1, 0.96])  # Leave space at bottom for colorbar
+
+    # Add colorbar at the bottom with more space
+    cbar = plt.colorbar(scatter, ax=axes, orientation='horizontal',
+                       pad=0.15, fraction=0.04, aspect=50, shrink=0.8)
+    cbar.set_label(color_label, fontsize=11)
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
