@@ -24,6 +24,9 @@ from collections import deque, namedtuple
 # Experience tuple for replay buffer
 Experience = namedtuple('Experience', ['obs', 'action', 'reward', 'next_obs', 'done', 'state', 'next_state'])
 
+# Trial tuple for trial-based replay buffer
+Trial = namedtuple('Trial', ['obs_list', 'action_list', 'reward_list', 'done_list'])
+
 
 class ReplayBuffer:
     """Simple replay buffer for DQN."""
@@ -49,6 +52,66 @@ class ReplayBuffer:
         next_states = torch.stack([e.next_state for e in experiences])
 
         return obs, actions, rewards, next_obs, dones, states, next_states
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class TrialReplayBuffer:
+    """
+    Replay buffer for storing complete trial sequences.
+
+    Used for training recurrent networks like MPNs where temporal coherence
+    is important. Instead of storing individual transitions, this buffer stores
+    complete trial sequences and samples entire trials for training.
+
+    This solves the "stale state" problem where stored MPN states were computed
+    by old network parameters. By replaying trials from scratch, we regenerate
+    states using the current network.
+    """
+
+    def __init__(self, capacity=1000):
+        """
+        Args:
+            capacity: Maximum number of trials to store (not timesteps)
+        """
+        self.buffer = deque(maxlen=capacity)
+
+    def push_trial(self, obs_list, action_list, reward_list, done_list):
+        """
+        Add a complete trial to the buffer.
+
+        Args:
+            obs_list: List of observations for the trial (each is a tensor)
+            action_list: List of actions (integers)
+            reward_list: List of rewards (floats)
+            done_list: List of done flags (booleans)
+        """
+        # Convert lists to tensors for efficient storage
+        obs_tensor = torch.stack(obs_list)  # [T, obs_dim]
+        action_tensor = torch.tensor(action_list, dtype=torch.long)  # [T]
+        reward_tensor = torch.tensor(reward_list, dtype=torch.float32)  # [T]
+        done_tensor = torch.tensor(done_list, dtype=torch.float32)  # [T]
+
+        trial = Trial(
+            obs_list=obs_tensor,
+            action_list=action_tensor,
+            reward_list=reward_tensor,
+            done_list=done_tensor
+        )
+        self.buffer.append(trial)
+
+    def sample(self, batch_size):
+        """
+        Sample a batch of complete trials.
+
+        Args:
+            batch_size: Number of trials to sample
+
+        Returns:
+            List of Trial namedtuples
+        """
+        return random.sample(self.buffer, min(batch_size, len(self.buffer)))
 
     def __len__(self):
         return len(self.buffer)
@@ -92,6 +155,91 @@ def compute_td_loss(dqn, target_dqn, batch, gamma=0.99):
     loss = F.smooth_l1_loss(current_q, target_q)
 
     return loss
+
+
+def compute_td_loss_trial(dqn, target_dqn, trial_batch, gamma=0.99, device='cpu'):
+    """
+    Compute TD loss for DQN over complete trial sequences.
+
+    Key innovation: Replays each trial from scratch, regenerating MPN states
+    using the current network. This solves the "stale state" problem where
+    stored states were computed by old network parameters.
+
+    Uses Double DQN update: Q_target = r + γ * Q_target(s', argmax_a Q_online(s', a))
+
+    Args:
+        dqn: Online DQN network
+        target_dqn: Target DQN network
+        trial_batch: List of Trial namedtuples (from TrialReplayBuffer.sample())
+        gamma: Discount factor
+        device: Device to run on ('cpu' or 'cuda')
+
+    Returns:
+        loss: Average smooth L1 loss across all trials and timesteps
+    """
+    total_loss = 0.0
+    total_timesteps = 0
+
+    for trial in trial_batch:
+        # Get trial data
+        obs_seq = trial.obs_list.to(device)  # [T, obs_dim]
+        actions = trial.action_list.to(device)  # [T]
+        rewards = trial.reward_list.to(device)  # [T]
+        dones = trial.done_list.to(device)  # [T]
+
+        trial_length = obs_seq.shape[0]
+
+        # Initialize MPN state (fresh state from current network!)
+        state = dqn.init_state(batch_size=1, device=device)
+
+        # Forward pass through trial
+        q_values_list = []
+        next_states_list = []
+
+        for t in range(trial_length):
+            obs_t = obs_seq[t].unsqueeze(0)  # [1, obs_dim]
+            q_values, next_state = dqn(obs_t, state)
+
+            q_values_list.append(q_values)
+            next_states_list.append(next_state)
+
+            state = next_state
+
+        # Compute TD targets for all timesteps
+        with torch.no_grad():
+            # For Double DQN: use online network to select actions, target network to evaluate
+            # Get next Q-values for all timesteps at once
+            next_q_values_target = []
+
+            for t in range(trial_length):
+                if t < trial_length - 1:
+                    # Select best action using online network's Q-values (already computed)
+                    next_q_online = q_values_list[t+1]
+                    best_next_action = next_q_online.argmax(dim=1, keepdim=True)
+
+                    # Evaluate that action using target network
+                    next_obs_t = obs_seq[t+1].unsqueeze(0)
+                    q_target, _ = target_dqn(next_obs_t, next_states_list[t])
+                    next_q = q_target.gather(1, best_next_action).squeeze()
+                else:
+                    # Terminal state
+                    next_q = torch.tensor(0.0, device=device)
+
+                next_q_values_target.append(next_q)
+
+        # Compute loss for this trial
+        for t in range(trial_length):
+            current_q = q_values_list[t].gather(1, actions[t].unsqueeze(0).unsqueeze(0)).squeeze()
+            target_q = rewards[t] + gamma * next_q_values_target[t] * (1 - dones[t])
+
+            loss = F.smooth_l1_loss(current_q, target_q)
+            total_loss += loss
+            total_timesteps += 1
+
+    # Average loss over all timesteps in batch
+    avg_loss = total_loss / total_timesteps if total_timesteps > 0 else torch.tensor(0.0)
+
+    return avg_loss
 
 
 # Word lists for random experiment names

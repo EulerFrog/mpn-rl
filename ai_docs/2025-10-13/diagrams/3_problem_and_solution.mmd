@@ -1,0 +1,54 @@
+graph TB
+    subgraph Problem["PROBLEM: Stale States in Random Replay"]
+        direction LR
+
+        subgraph EP1["Episode 1 (old network)"]
+            T1[t=50<br/>state_50]
+            T2[t=100<br/>state_100]
+        end
+
+        subgraph Buffer1["ReplayBuffer"]
+            B1[transition t=50<br/>STALE state_50]
+            B2[transition t=100<br/>STALE state_100]
+        end
+
+        subgraph Training1["Training (current network)"]
+            S1[Random sample<br/>Uses STALE states<br/>Breaks temporal coherence]
+        end
+
+        T1 --> B1
+        T2 --> B2
+        B1 -.-> S1
+        B2 -.-> S1
+
+        style B1 fill:#ffcccc,stroke:#ff0000,stroke-width:3px
+        style B2 fill:#ffcccc,stroke:#ff0000,stroke-width:3px
+        style S1 fill:#ffcccc,stroke:#ff0000,stroke-width:3px
+    end
+
+    subgraph Solution["SOLUTION: Trial-Based Replay from Scratch"]
+        direction LR
+
+        subgraph Trials["Trial Collection"]
+            TR1[Trial 1<br/>Fixation-Stimulus-Delay-Response<br/>90 timesteps]
+            TR2[Trial 2<br/>Sample-Delay-Test<br/>90 timesteps]
+        end
+
+        subgraph Buffer2["TrialReplayBuffer"]
+            TB1[Complete Trial 1<br/>All timesteps stored]
+            TB2[Complete Trial 2<br/>All timesteps stored]
+        end
+
+        subgraph Training2["Training Replay"]
+            R1[Replay from scratch<br/>state = init_state<br/>FRESH states regenerated<br/>Temporal coherence preserved]
+        end
+
+        TR1 --> TB1
+        TR2 --> TB2
+        TB1 -.-> R1
+        TB2 -.-> R1
+
+        style TB1 fill:#ccffcc,stroke:#00aa00,stroke-width:3px
+        style TB2 fill:#ccffcc,stroke:#00aa00,stroke-width:3px
+        style R1 fill:#ccffcc,stroke:#00aa00,stroke-width:3px
+    end

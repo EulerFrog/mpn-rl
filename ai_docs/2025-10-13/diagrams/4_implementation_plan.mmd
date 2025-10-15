@@ -1,0 +1,50 @@
+classDiagram
+    class MPNDQN {
+        +obs_dim int
+        +hidden_dim int
+        +action_dim int
+        +forward(obs, state)
+        +init_state(batch_size)
+        +select_action(obs, state, epsilon)
+    }
+
+    class MPNModule {
+        +input_dim int
+        +hidden_dim int
+        +eta float
+        +lambda_ float
+        +forward(x, M_prev)
+        +init_M(batch_size)
+    }
+
+    class NeuroGymWrapper {
+        +env NeuroGym
+        +flatten_obs bool
+        +reset()
+        +step(action)
+        -_flatten(obs)
+        -_extract_trial_info(info)
+    }
+
+    class TrialReplayBuffer {
+        +trials deque
+        +capacity int
+        +push_trial(obs_list, actions, rewards, dones)
+        +sample(batch_size)
+        +len()
+    }
+
+    class TrainingLoop {
+        +mpn MPNDQN
+        +target_mpn MPNDQN
+        +env NeuroGymWrapper
+        +buffer TrialReplayBuffer
+        +collect_trial()
+        +train_on_trials()
+        +update_target_network()
+    }
+
+    MPNDQN --> MPNModule
+    TrainingLoop --> MPNDQN
+    TrainingLoop --> NeuroGymWrapper
+    TrainingLoop --> TrialReplayBuffer

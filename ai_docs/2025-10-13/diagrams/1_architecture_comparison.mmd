@@ -1,0 +1,38 @@
+graph TB
+    subgraph Current["CURRENT: Standard DQN with Transition Replay"]
+        CLI1[main.py CLI]
+        GymEnv[Gymnasium Env<br/>CartPole-v1]
+        MPN1[MPN-DQN]
+        ReplayBuffer[ReplayBuffer<br/>Stores individual transitions<br/>Random sampling]
+        TDLoss1[compute_td_loss<br/>Single transition]
+
+        CLI1 --> GymEnv
+        CLI1 --> MPN1
+        GymEnv -->|transitions| ReplayBuffer
+        ReplayBuffer -.->|random batch| TDLoss1
+        TDLoss1 -->|loss| MPN1
+
+        style ReplayBuffer fill:#ffcccc,stroke:#ff0000,stroke-width:3px
+        style TDLoss1 fill:#ffcccc,stroke:#ff0000,stroke-width:3px
+    end
+
+    subgraph Proposed["PROPOSED: Trial-Based Replay with NeuroGym"]
+        CLI2[main.py CLI<br/>+ neurogym subcommands]
+        NGymEnv[NeuroGym Env<br/>Memory Tasks]
+        Wrapper[NeuroGymWrapper<br/>Flatten obs<br/>Track trials]
+        MPN2[MPN-DQN]
+        TrialBuffer[TrialReplayBuffer<br/>Stores complete trials<br/>Sample full sequences]
+        TDLoss2[compute_td_loss_trial<br/>Full trial replay]
+
+        CLI2 --> Wrapper
+        CLI2 --> MPN2
+        NGymEnv --> Wrapper
+        Wrapper -->|complete trials| TrialBuffer
+        TrialBuffer -.->|sample trials| TDLoss2
+        TDLoss2 -->|loss| MPN2
+        MPN2 -.->|regenerate states| TDLoss2
+
+        style TrialBuffer fill:#ccffcc,stroke:#00aa00,stroke-width:3px
+        style TDLoss2 fill:#ccffcc,stroke:#00aa00,stroke-width:3px
+        style Wrapper fill:#cce5ff,stroke:#0066cc,stroke-width:3px
+    end
