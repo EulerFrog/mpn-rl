@@ -1,8 +1,20 @@
- python3 main.py train --experiment-name long-episode-test \
-      --max-episode-steps 2000 \
-      --num-episodes 1000 \
-      --plot-training
+ python3 main.py train-neurogym \
+      --sequence-length 20 \
+      --sequence-batch-size 8 \
+      --train-freq 1 \
+      --num-episodes 300 \
+      --max-episode-steps 500 \
+      --print-freq 5 \
+      --experiment-name longer-test \
+      --device cuda
 
-python3 main.py analyze collect experiment-name long-run-5k --max-episode-steps 50
-
-python3 main.py analyze plot --experiment-name long-run-5k --max-episode-steps 50
+ python3 main.py train-neurogym \
+      --sequence-length 20 \
+      --sequence-batch-size 8 \
+      --train-freq 1 \
+      --num-episodes 300 \
+      --max-episode-steps 500 \
+      --print-freq 5 \
+      --experiment-name longer-test-frozen \
+      --device cuda \
+      --freeze-plasticity

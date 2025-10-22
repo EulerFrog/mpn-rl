@@ -61,3 +61,4 @@ Thumbs.db
 # Test outputs
 test_*.gif
 test_*.png
+*.pdf

@@ -117,6 +117,125 @@ class TrialReplayBuffer:
         return len(self.buffer)
 
 
+class SequenceReplayBuffer:
+    """
+    DRQN-style replay buffer that stores transitions and samples fixed-length sequences.
+
+    Key features (from DRQN paper):
+    1. Stores individual transitions with episode tracking
+    2. Samples fixed-length sequences (default L=10)
+    3. Zero-pads at episode boundaries to prevent training on invalid sequences
+
+    This matches the approach from "Deep Recurrent Q-Learning with Recurrent Neural Networks"
+    (Chen, Ying, Laird), which showed this is critical for stable recurrent Q-learning.
+
+    Example:
+        Episode 1: [s0, s1, s2, s3] (episode_id=0)
+        Episode 2: [s4, s5, s6, s7, s8] (episode_id=1)
+
+        If we sample ending at s6 with L=4, we get:
+        [zero, zero, s4, s5] - first 2 are zero-padded because they're from episode 0
+    """
+
+    def __init__(self, capacity=10000, sequence_length=10):
+        """
+        Args:
+            capacity: Maximum number of transitions to store
+            sequence_length: Fixed length L for sampled sequences (DRQN uses L=16)
+        """
+        self.buffer = deque(maxlen=capacity)
+        self.sequence_length = sequence_length
+        self._zero_transition_template = None
+
+    def push(self, obs, action, reward, next_obs, done, episode_id):
+        """
+        Store a single transition with episode tracking.
+
+        Args:
+            obs: Observation tensor [obs_dim]
+            action: Action (int)
+            reward: Reward (float)
+            next_obs: Next observation tensor [obs_dim]
+            done: Done flag (bool)
+            episode_id: Episode ID for tracking boundaries (int)
+        """
+        # Create zero transition template if not exists
+        if self._zero_transition_template is None:
+            self._zero_transition_template = {
+                'obs': torch.zeros_like(obs),
+                'action': 0,
+                'reward': 0.0,
+                'next_obs': torch.zeros_like(obs),
+                'done': False,
+                'episode_id': -1
+            }
+
+        self.buffer.append({
+            'obs': obs,
+            'action': action,
+            'reward': reward,
+            'next_obs': next_obs,
+            'done': done,
+            'episode_id': episode_id
+        })
+
+    def sample(self, batch_size):
+        """
+        Sample batch_size fixed-length sequences with zero-padding at episode boundaries.
+
+        Following DRQN paper (Page 3):
+        "We sample et ~ U(D), take the previous L states, {st-(L+1), ..., st},
+        and then zero out states from previous games."
+
+        Args:
+            batch_size: Number of sequences to sample
+
+        Returns:
+            List of sequences, each a list of L transitions (dicts)
+        """
+        if len(self.buffer) < self.sequence_length:
+            return []
+
+        sequences = []
+
+        for _ in range(batch_size):
+            # Sample random end position (must have at least sequence_length elements before it)
+            end_idx = random.randint(self.sequence_length - 1, len(self.buffer) - 1)
+
+            # Get the episode ID at the end position
+            current_episode = self.buffer[end_idx]['episode_id']
+
+            # Build sequence by looking back L steps
+            sequence = []
+            for i in range(self.sequence_length):
+                idx = end_idx - (self.sequence_length - 1) + i
+                transition = self.buffer[idx]
+
+                # Zero out if from different episode (CRITICAL for DRQN)
+                if transition['episode_id'] != current_episode:
+                    sequence.append(self._get_zero_transition())
+                else:
+                    sequence.append(transition)
+
+            sequences.append(sequence)
+
+        return sequences
+
+    def _get_zero_transition(self):
+        """Return a zero-padded transition for episode boundaries."""
+        return {
+            'obs': self._zero_transition_template['obs'].clone(),
+            'action': 0,
+            'reward': 0.0,
+            'next_obs': self._zero_transition_template['next_obs'].clone(),
+            'done': False,
+            'episode_id': -1
+        }
+
+    def __len__(self):
+        return len(self.buffer)
+
+
 def compute_td_loss(dqn, target_dqn, batch, gamma=0.99):
     """
     Compute TD loss for DQN.
@@ -157,25 +276,156 @@ def compute_td_loss(dqn, target_dqn, batch, gamma=0.99):
     return loss
 
 
-def compute_td_loss_trial(dqn, target_dqn, trial_batch, gamma=0.99, device='cpu'):
+def compute_td_loss_sequences(dqn, target_dqn, sequences, gamma=0.99, device='cpu'):
     """
-    Compute TD loss for DQN over complete trial sequences.
+    Compute TD loss over fixed-length sequences (parallel batch processing).
 
-    Key innovation: Replays each trial from scratch, regenerating MPN states
-    using the current network. This solves the "stale state" problem where
-    stored states were computed by old network parameters.
-
-    Uses Double DQN update: Q_target = r + γ * Q_target(s', argmax_a Q_online(s', a))
+    Optimized version that processes all sequences in parallel for GPU efficiency.
+    - Each sequence has fixed length L (e.g., 10-20 timesteps)
+    - Full BPTT through the sequence (no chunking needed)
+    - Zero-padded transitions are skipped in loss computation
+    - All sequences processed in parallel with batch_size=len(sequences)
 
     Args:
-        dqn: Online DQN network
+        dqn: Online DQN network (MPNDQN)
         target_dqn: Target DQN network
-        trial_batch: List of Trial namedtuples (from TrialReplayBuffer.sample())
+        sequences: List of sequences from SequenceReplayBuffer.sample()
+                  Each sequence is a list of L transitions (dicts)
         gamma: Discount factor
         device: Device to run on ('cpu' or 'cuda')
 
     Returns:
+        loss: Average smooth L1 loss across all sequences and timesteps
+    """
+    if not sequences:
+        return torch.tensor(0.0, device=device)
+
+    batch_size = len(sequences)
+    seq_len = len(sequences[0])
+
+    # Stack all sequences into batched tensors [batch_size, seq_len, ...]
+    obs_batch = torch.stack([
+        torch.stack([sequences[b][t]['obs'] for t in range(seq_len)])
+        for b in range(batch_size)
+    ]).to(device)  # [batch_size, seq_len, obs_dim]
+
+    next_obs_batch = torch.stack([
+        torch.stack([sequences[b][t]['next_obs'] for t in range(seq_len)])
+        for b in range(batch_size)
+    ]).to(device)  # [batch_size, seq_len, obs_dim]
+
+    actions_batch = torch.tensor([
+        [sequences[b][t]['action'] for t in range(seq_len)]
+        for b in range(batch_size)
+    ], dtype=torch.long, device=device)  # [batch_size, seq_len]
+
+    rewards_batch = torch.tensor([
+        [sequences[b][t]['reward'] for t in range(seq_len)]
+        for b in range(batch_size)
+    ], dtype=torch.float32, device=device)  # [batch_size, seq_len]
+
+    dones_batch = torch.tensor([
+        [sequences[b][t]['done'] for t in range(seq_len)]
+        for b in range(batch_size)
+    ], dtype=torch.float32, device=device)  # [batch_size, seq_len]
+
+    episode_ids_batch = torch.tensor([
+        [sequences[b][t]['episode_id'] for t in range(seq_len)]
+        for b in range(batch_size)
+    ], dtype=torch.long, device=device)  # [batch_size, seq_len]
+
+    # Initialize states for all sequences in batch
+    state = dqn.init_state(batch_size=batch_size, device=device)
+
+    # Forward pass through all sequences in parallel
+    q_values_list = []
+    for t in range(seq_len):
+        q_values, state = dqn(obs_batch[:, t, :], state)
+        q_values_list.append(q_values)  # Each is [batch_size, action_dim]
+
+    # Compute target Q-values (Double DQN)
+    with torch.no_grad():
+        target_state = target_dqn.init_state(batch_size=batch_size, device=device)
+        target_q_list = []
+
+        for t in range(seq_len):
+            target_q, target_state = target_dqn(next_obs_batch[:, t, :], target_state)
+            target_q_list.append(target_q)  # Each is [batch_size, action_dim]
+
+    # Compute loss for all timesteps
+    total_loss = 0.0
+    total_timesteps = 0
+
+    for t in range(seq_len):
+        # Mask for valid (non-zero-padded) transitions
+        valid_mask = episode_ids_batch[:, t] != -1  # [batch_size]
+
+        if not valid_mask.any():
+            continue
+
+        # Current Q-values for actions taken
+        current_q = q_values_list[t].gather(1, actions_batch[:, t].unsqueeze(1)).squeeze(1)  # [batch_size]
+
+        # TD targets
+        if t < seq_len - 1:
+            # Not last timestep: use next Q-values
+            with torch.no_grad():
+                # Double DQN: select action with online, evaluate with target
+                next_actions = q_values_list[t + 1].argmax(dim=1, keepdim=True)  # [batch_size, 1]
+                next_q = target_q_list[t + 1].gather(1, next_actions).squeeze(1)  # [batch_size]
+
+                # TD target: r + γ * Q(s', a') * (1 - done)
+                target_q = rewards_batch[:, t] + gamma * next_q * (1 - dones_batch[:, t])
+        else:
+            # Last timestep: just reward
+            target_q = rewards_batch[:, t]
+
+        # Apply mask and compute loss only for valid transitions
+        if valid_mask.any():
+            loss = F.smooth_l1_loss(current_q[valid_mask], target_q[valid_mask], reduction='sum')
+            total_loss += loss
+            total_timesteps += valid_mask.sum().item()
+
+    # Average loss
+    avg_loss = total_loss / total_timesteps if total_timesteps > 0 else torch.tensor(0.0, device=device)
+
+    return avg_loss
+
+
+def compute_td_loss_trial(dqn, target_dqn, trial_batch, gamma=0.99, device='cpu',
+                          bptt_chunk_size=None):
+    """
+    Compute TD loss for DQN over complete trial sequences with optional Truncated BPTT.
+
+    Key features:
+    - Replays each trial from scratch with fresh MPN state
+    - Uses Truncated BPTT to manage memory for long sequences
+    - Properly handles MPN's Hebbian plasticity during forward pass
+    - Uses Double DQN for stable target values
+
+    MPN Architecture Notes:
+    - W (weight matrix) is learned via backpropagation
+    - M (modulation matrix) is updated via Hebbian rule during forward pass
+    - Truncated BPTT breaks gradient flow through M updates across chunks
+    - This allows efficient training on long sequences (100-800 timesteps)
+
+    Args:
+        dqn: Online DQN network (MPNDQN)
+        target_dqn: Target DQN network
+        trial_batch: List of Trial namedtuples (from TrialReplayBuffer.sample())
+        gamma: Discount factor
+        device: Device to run on ('cpu' or 'cuda')
+        bptt_chunk_size: Chunk size for Truncated BPTT. If None, uses full BPTT
+                        through entire trial. Recommended: 20-50 for long sequences.
+
+    Returns:
         loss: Average smooth L1 loss across all trials and timesteps
+
+    Implementation Details:
+    - Each trial is processed sequentially (batch_size=1 through time)
+    - If bptt_chunk_size is set, gradients are truncated between chunks
+    - State (M matrix) continues across chunks but gradients are detached
+    - This allows MPN to maintain memory while keeping gradients manageable
     """
     total_loss = 0.0
     total_timesteps = 0
@@ -192,52 +442,86 @@ def compute_td_loss_trial(dqn, target_dqn, trial_batch, gamma=0.99, device='cpu'
         # Initialize MPN state (fresh state from current network!)
         state = dqn.init_state(batch_size=1, device=device)
 
-        # Forward pass through trial
-        q_values_list = []
-        next_states_list = []
+        # Determine chunking strategy
+        if bptt_chunk_size is None or bptt_chunk_size >= trial_length:
+            # Full BPTT through entire trial
+            chunks = [(0, trial_length)]
+        else:
+            # Truncated BPTT: break into chunks
+            chunks = []
+            for chunk_start in range(0, trial_length, bptt_chunk_size):
+                chunk_end = min(chunk_start + bptt_chunk_size, trial_length)
+                chunks.append((chunk_start, chunk_end))
 
-        for t in range(trial_length):
-            obs_t = obs_seq[t].unsqueeze(0)  # [1, obs_dim]
-            q_values, next_state = dqn(obs_t, state)
+        # Process each chunk
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
+            chunk_length = chunk_end - chunk_start
 
-            q_values_list.append(q_values)
-            next_states_list.append(next_state)
+            # Forward pass through chunk
+            q_values_list = []
+            states_list = [state]  # Store initial state for this chunk
 
-            state = next_state
+            current_state = state
+            for t in range(chunk_start, chunk_end):
+                obs_t = obs_seq[t].unsqueeze(0)  # [1, obs_dim]
+                q_values, next_state = dqn(obs_t, current_state)
 
-        # Compute TD targets for all timesteps
-        with torch.no_grad():
-            # For Double DQN: use online network to select actions, target network to evaluate
-            # Get next Q-values for all timesteps at once
-            next_q_values_target = []
+                q_values_list.append(q_values)
+                states_list.append(next_state)
 
-            for t in range(trial_length):
-                if t < trial_length - 1:
-                    # Select best action using online network's Q-values (already computed)
-                    next_q_online = q_values_list[t+1]
-                    best_next_action = next_q_online.argmax(dim=1, keepdim=True)
+                current_state = next_state
 
-                    # Evaluate that action using target network
-                    next_obs_t = obs_seq[t+1].unsqueeze(0)
-                    q_target, _ = target_dqn(next_obs_t, next_states_list[t])
-                    next_q = q_target.gather(1, best_next_action).squeeze()
-                else:
-                    # Terminal state
-                    next_q = torch.tensor(0.0, device=device)
+            # Compute TD targets for this chunk
+            with torch.no_grad():
+                next_q_values_target = []
 
-                next_q_values_target.append(next_q)
+                for i, t in enumerate(range(chunk_start, chunk_end)):
+                    if t < trial_length - 1:
+                        # Need to check if next timestep is in current chunk or next chunk
+                        if t + 1 < chunk_end:
+                            # Next timestep in current chunk - use already computed Q-values
+                            next_q_online = q_values_list[i + 1]
+                            next_state_for_target = states_list[i]
+                        else:
+                            # Next timestep in next chunk - need to compute
+                            next_obs_t = obs_seq[t + 1].unsqueeze(0)
+                            next_q_online, _ = dqn(next_obs_t, current_state)
+                            next_state_for_target = current_state
 
-        # Compute loss for this trial
-        for t in range(trial_length):
-            current_q = q_values_list[t].gather(1, actions[t].unsqueeze(0).unsqueeze(0)).squeeze()
-            target_q = rewards[t] + gamma * next_q_values_target[t] * (1 - dones[t])
+                        best_next_action = next_q_online.argmax(dim=1, keepdim=True)
 
-            loss = F.smooth_l1_loss(current_q, target_q)
-            total_loss += loss
-            total_timesteps += 1
+                        # Evaluate with target network
+                        next_obs_t = obs_seq[t + 1].unsqueeze(0)
+                        q_target, _ = target_dqn(next_obs_t, next_state_for_target)
+                        next_q = q_target.gather(1, best_next_action).squeeze()
+                    else:
+                        # Terminal state
+                        next_q = torch.tensor(0.0, device=device)
+
+                    next_q_values_target.append(next_q)
+
+            # Compute loss for this chunk
+            chunk_loss = 0.0
+            for i, t in enumerate(range(chunk_start, chunk_end)):
+                current_q = q_values_list[i].gather(1, actions[t].unsqueeze(0).unsqueeze(0)).squeeze()
+                target_q = rewards[t] + gamma * next_q_values_target[i] * (1 - dones[t])
+
+                loss = F.smooth_l1_loss(current_q, target_q)
+                chunk_loss += loss
+                total_timesteps += 1
+
+            # Accumulate chunk loss
+            total_loss += chunk_loss
+
+            # Truncate gradients between chunks (key for Truncated BPTT)
+            # The state continues but gradients don't flow backward past this point
+            if chunk_idx < len(chunks) - 1:  # Not the last chunk
+                state = current_state.detach()
+            else:
+                state = current_state
 
     # Average loss over all timesteps in batch
-    avg_loss = total_loss / total_timesteps if total_timesteps > 0 else torch.tensor(0.0)
+    avg_loss = total_loss / total_timesteps if total_timesteps > 0 else torch.tensor(0.0, device=device)
 
     return avg_loss
 

@@ -57,12 +57,14 @@ class MPNDQN(nn.Module):
         eta: float = 0.01,
         lambda_decay: float = 0.95,
         activation: str = 'tanh',
+        freeze_plasticity: bool = False,
     ):
         super().__init__()
 
         self.obs_dim = obs_dim
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
+        self.freeze_plasticity = freeze_plasticity
 
         # MPN recurrent layer
         self.mpn = MPN(
@@ -70,7 +72,8 @@ class MPNDQN(nn.Module):
             hidden_dim=hidden_dim,
             eta=eta,
             lambda_decay=lambda_decay,
-            activation=activation
+            activation=activation,
+            freeze_plasticity=freeze_plasticity
         )
 
         # Q-value head
@@ -191,6 +194,7 @@ class DoubleMPNDQN(nn.Module):
         eta: float = 0.01,
         lambda_decay: float = 0.95,
         activation: str = 'tanh',
+        freeze_plasticity: bool = False,
     ):
         super().__init__()
 
@@ -201,7 +205,8 @@ class DoubleMPNDQN(nn.Module):
             action_dim=action_dim,
             eta=eta,
             lambda_decay=lambda_decay,
-            activation=activation
+            activation=activation,
+            freeze_plasticity=freeze_plasticity
         )
 
         # Target network (updated via soft/hard updates from online)
@@ -211,7 +216,8 @@ class DoubleMPNDQN(nn.Module):
             action_dim=action_dim,
             eta=eta,
             lambda_decay=lambda_decay,
-            activation=activation
+            activation=activation,
+            freeze_plasticity=freeze_plasticity
         )
 
         # Initialize target network with same weights as online

@@ -51,6 +51,7 @@ class MPNLayer(nn.Module):
         lambda_decay: float = 0.95,
         activation: str = 'tanh',
         bias: bool = True,
+        freeze_plasticity: bool = False,
     ):
         super().__init__()
 
@@ -58,6 +59,7 @@ class MPNLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.eta = eta
         self.lambda_decay = lambda_decay
+        self.freeze_plasticity = freeze_plasticity
 
         # Long-term synaptic weights (trainable via backprop)
         # Shape: [hidden_dim, input_dim]
@@ -143,12 +145,16 @@ class MPNLayer(nn.Module):
         h = self.activation(y_tilde)
 
         # Hebbian update: M_new = λ*M + η*h*x^T
-        # h shape: [batch_size, hidden_dim, 1]
-        # x shape: [batch_size, 1, input_dim]
-        # h @ x^T: [batch_size, hidden_dim, input_dim]
-        M_new = self.lambda_decay * M + self.eta * torch.bmm(
-            h.unsqueeze(2), x.unsqueeze(1)
-        )
+        # If freeze_plasticity is True, keep M at zero (no memory/context)
+        if self.freeze_plasticity:
+            M_new = M  # Keep at zero (no update)
+        else:
+            # h shape: [batch_size, hidden_dim, 1]
+            # x shape: [batch_size, 1, input_dim]
+            # h @ x^T: [batch_size, hidden_dim, input_dim]
+            M_new = self.lambda_decay * M + self.eta * torch.bmm(
+                h.unsqueeze(2), x.unsqueeze(1)
+            )
 
         return h, M_new
 
@@ -191,11 +197,13 @@ class MPN(nn.Module):
         eta: float = 0.01,
         lambda_decay: float = 0.95,
         activation: str = 'tanh',
+        freeze_plasticity: bool = False,
     ):
         super().__init__()
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.freeze_plasticity = freeze_plasticity
 
         # MPN layer
         self.mpn_layer = MPNLayer(
@@ -204,7 +212,8 @@ class MPN(nn.Module):
             eta=eta,
             lambda_decay=lambda_decay,
             activation=activation,
-            bias=True
+            bias=True,
+            freeze_plasticity=freeze_plasticity
         )
 
     def init_state(self, batch_size: int, device: Optional[torch.device] = None) -> torch.Tensor:

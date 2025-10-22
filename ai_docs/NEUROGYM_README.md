@@ -1,12 +1,20 @@
 # Training MPN-DQN on NeuroGym Environments
 
-This guide shows how to train MPN-DQN agents on NeuroGym cognitive neuroscience tasks using **trial-based replay**.
+This guide shows how to train MPN-DQN agents on NeuroGym cognitive neuroscience tasks using **trial-based replay with Truncated BPTT**.
+
+**Recent Updates (2025-10-20):**
+- ✅ MPN state now persists across trials (only resets between episodes)
+- ✅ Truncated BPTT support for efficient training on long sequences
+- ✅ Configurable chunk size for memory management
 
 ## Quick Start
 
 ```bash
 # Train on ContextDecisionMaking (default)
 python main.py train-neurogym
+
+# Train with Truncated BPTT (recommended for long sequences)
+python main.py train-neurogym --bptt-chunk-size 30
 
 # Train on specific environment
 python main.py train-neurogym --env-name DelayMatchSample-v0
@@ -16,6 +24,7 @@ python main.py train-neurogym \
     --experiment-name my-neurogym-run \
     --num-episodes 2000 \
     --hidden-dim 256 \
+    --bptt-chunk-size 30 \
     --plot-training
 ```
 
@@ -31,10 +40,17 @@ See: https://neurogym.github.io/neurogym/latest/
 
 ## Key Differences from Standard Training
 
-### Trial-Based Replay
+### MPN Architecture (Not a Standard RNN!)
+- **W (weights)**: Learned via backpropagation
+- **M (modulation matrix)**: Updated via Hebbian plasticity during forward pass
+- **State persistence**: M matrix persists across trials within an episode
+- **State reset**: Only resets at episode boundaries (not trial boundaries)
+
+### Trial-Based Replay with Truncated BPTT
 - Stores **complete trial sequences** (not individual transitions)
 - Replays trials from scratch (regenerates fresh MPN states)
-- Solves the "stale state" problem for recurrent networks
+- Uses Truncated BPTT to manage memory for long sequences (100-800 steps)
+- Configurable chunk size for gradient truncation
 
 ### Hyperparameter Defaults
 Different defaults optimized for NeuroGym tasks:
@@ -47,6 +63,7 @@ Different defaults optimized for NeuroGym tasks:
 | `epsilon_start` | 1.0 | 0.3 |
 | `trial_batch_size` | N/A | 4 |
 | `buffer_size` | 10000 (transitions) | 500 (trials) |
+| `bptt_chunk_size` | N/A | None (full) |
 
 ## Command Line Options
 
@@ -62,7 +79,14 @@ python main.py train-neurogym --help
 - `--lambda-decay` - M matrix decay (default: 0.95)
 - `--trial-batch-size` - Trials per batch (default: 4)
 - `--buffer-size` - Trial buffer capacity (default: 500 trials)
+- `--bptt-chunk-size` - Chunk size for Truncated BPTT (default: None = full BPTT)
 - `--device` - Device: auto/cuda/cpu (default: auto)
+
+**Note on `--bptt-chunk-size`:**
+- `None` (default): Full BPTT through entire trial (memory intensive for long trials)
+- `20-50`: Recommended for long sequences (100-800 steps), balances memory and learning
+- Smaller values: Less memory, more gradient truncation
+- Larger values: More memory, better gradient flow
 
 ## Examples
 
@@ -84,13 +108,14 @@ python main.py train-neurogym \
 
 ### Hyperparameter Tuning
 ```bash
-# Larger network, stronger memory
+# Larger network, stronger memory, with Truncated BPTT
 python3 main.py train-neurogym \
     --hidden-dim 256 \
     --eta 0.15 \
     --lambda-decay 0.98 \
     --trial-batch-size 8 \
-    --buffer-size 1000
+    --buffer-size 1000 \
+    --bptt-chunk-size 40
 ```
 
 ### Multiple Environments
@@ -135,18 +160,34 @@ python3 main.py train-neurogym --print-freq 5
 # Ep   100/1000 | Reward:    0.45 | Len:  287 | Loss: 0.0234 | ε: 0.152 | Trials:   45
 ```
 
-## Understanding Trial-Based Training
+## Understanding MPN Training (Updated 2025-10-20)
 
-### What's Different?
-1. **Collection**: Collects complete trials (100-800 timesteps)
-2. **Storage**: Buffer stores trials (not individual transitions)
-3. **Sampling**: Samples complete trials for training
-4. **Replay**: Regenerates MPN states from scratch during replay
-5. **State Reset**: MPN state reset at each trial boundary
+### MPN vs Standard RNN
+**MPN is NOT a standard RNN!** Key differences:
+- **Standard RNN**: All parameters learned via backpropagation
+- **MPN**:
+  - W (weights) learned via backpropagation
+  - M (modulation) updated via Hebbian plasticity (during forward pass)
+  - M provides fast within-episode adaptation
+  - W provides slow across-episode learning
+
+### State Management
+1. **Collection**: MPN state **persists across trials** within an episode
+2. **Storage**: Buffer stores complete trial sequences
+3. **Sampling**: Samples random trials for training
+4. **Replay**: Replays from zero state (simpler, still learns dynamics)
+5. **State Reset**: Only resets at **episode boundaries** (not trial boundaries!)
+
+### Truncated BPTT
+For long sequences (100-800 timesteps):
+- Breaks trial into chunks (e.g., 30 timesteps)
+- Gradients truncated between chunks
+- State (M matrix) continues across chunks
+- Reduces memory usage, enables longer training
 
 ### Why Trial-Based?
 Standard DQN replay breaks for recurrent networks because:
-- ❌ Random sampling uses "stale" MPN states (computed by old network)
+- ❌ Random sampling uses "stale" states (computed by old network)
 - ❌ Temporal coherence broken
 - ❌ Difficult with sparse rewards
 
@@ -155,6 +196,8 @@ Trial-based replay solves this:
 - ✅ Temporal coherence preserved
 - ✅ Natural for NeuroGym's trial structure
 - ✅ Handles sparse rewards naturally
+
+**For detailed architecture explanation, see:** `ai_docs/MPN_TRAINING_ARCHITECTURE.md`
 
 ## Troubleshooting
 

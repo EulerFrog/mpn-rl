@@ -33,19 +33,86 @@ import sys
 import time
 import torch
 import numpy as np
+import math
 from pathlib import Path
 
 # MPN-DQN imports
 from mpn_dqn import MPNDQN
 from model_utils import (ExperimentManager, save_checkpoint, load_checkpoint_for_eval,
                          load_checkpoint_for_resume, ReplayBuffer, compute_td_loss,
-                         TrialReplayBuffer, compute_td_loss_trial)
+                         TrialReplayBuffer, compute_td_loss_trial,
+                         SequenceReplayBuffer, compute_td_loss_sequences)
 from visualize import TrainingVisualizer
 from render_utils import render_episode_to_gif
 from neurogym_wrapper import make_neurogym_env
 
 # Gym import
 import gymnasium as gym
+
+
+def get_epsilon(episode, total_episodes, epsilon_start, epsilon_end, decay_type='linear', decay_param=None):
+    """
+    Compute epsilon for exploration-exploitation tradeoff.
+
+    Args:
+        episode: Current episode number
+        total_episodes: Total number of episodes
+        epsilon_start: Starting epsilon value
+        epsilon_end: Minimum epsilon value
+        decay_type: Type of decay ('linear', 'exponential', 'step')
+        decay_param: Additional parameter for specific decay types
+                     - exponential: decay rate (default: auto-computed to reach epsilon_end in 30% of episodes)
+                     - step: list of (episode_fraction, epsilon_value) tuples
+
+    Returns:
+        epsilon: Current epsilon value
+    """
+    # Fraction of training completed
+    progress = episode / total_episodes
+
+    # Decay schedule reaches epsilon_end at 30% of training
+    decay_fraction = 0.3
+
+    if decay_type == 'linear':
+        # Linear decay from epsilon_start to epsilon_end over decay_fraction of episodes
+        if progress <= decay_fraction:
+            epsilon = epsilon_start - (epsilon_start - epsilon_end) * (progress / decay_fraction)
+        else:
+            epsilon = epsilon_end
+
+    elif decay_type == 'exponential':
+        # Exponential decay: epsilon = epsilon_start * decay_rate^episode
+        # Compute decay_rate to reach epsilon_end at decay_fraction of training
+        if decay_param is None:
+            decay_episodes = int(total_episodes * decay_fraction)
+            decay_param = math.exp(math.log(epsilon_end / epsilon_start) / decay_episodes)
+
+        epsilon = epsilon_start * (decay_param ** episode)
+        epsilon = max(epsilon, epsilon_end)
+
+    elif decay_type == 'step':
+        # Step decay: drop epsilon at specific milestones
+        if decay_param is None:
+            # Default: drop at 10%, 20%, 30% of episodes
+            decay_param = [
+                (0.0, epsilon_start),
+                (0.10, epsilon_start * 0.7),
+                (0.20, epsilon_start * 0.4),
+                (0.30, epsilon_end)
+            ]
+
+        # Find the appropriate epsilon value for current progress
+        epsilon = epsilon_end
+        for i in range(len(decay_param) - 1, -1, -1):
+            threshold, eps_value = decay_param[i]
+            if progress >= threshold:
+                epsilon = eps_value
+                break
+
+    else:
+        raise ValueError(f"Unknown decay_type: {decay_type}. Supported types: 'linear', 'exponential', 'step'")
+
+    return epsilon
 
 
 def get_device(device_str='auto'):
@@ -136,7 +203,7 @@ def train(args):
     replay_buffer = ReplayBuffer(capacity=args.buffer_size)
 
     # Visualization
-    viz = TrainingVisualizer() if args.plot_training else None
+    viz = TrainingVisualizer()
 
     # Training loop
     epsilon = args.epsilon_start
@@ -248,9 +315,8 @@ def train(args):
                    final_avg_reward, is_best=False, is_final=True)
 
     # Plot training curves
-    if viz is not None:
-        plot_path = exp_manager.plot_dir / "training_curves.png"
-        viz.plot(save_path=str(plot_path))
+    plot_path = exp_manager.plot_dir / "training_curves.png"
+    viz.plot(save_path=str(plot_path))
 
     env.close()
     print("\n" + "="*60)
@@ -262,40 +328,38 @@ def train(args):
 
 
 def train_neurogym(args):
-    """Train MPN-DQN on NeuroGym environment with trial-based replay."""
+    """Train MPN-DQN on NeuroGym environment with sequence replay."""
     print("="*60)
-    print("Training MPN-DQN on NeuroGym (Trial-Based Replay)")
+    print("Training MPN-DQN on NeuroGym (Sequence Replay)")
     print("="*60)
 
-    print("[DEBUG] Creating experiment manager...")
     # Create experiment manager
     exp_manager = ExperimentManager(args.experiment_name)
     print(f"Experiment: {exp_manager.experiment_name}")
     print(f"Directory: {exp_manager.exp_dir}\n")
 
-    print("[DEBUG] Saving configuration...")
     # Save configuration
     config = vars(args)
     exp_manager.save_config(config)
 
-    print("[DEBUG] Setting up device...")
     # Setup device (GPU/CPU)
     device = get_device(args.device)
     print()
 
-    print("[DEBUG] Creating NeuroGym environment...")
     # Create NeuroGym environment
     print(f"Creating NeuroGym environment: {args.env_name}")
-    env = make_neurogym_env(args.env_name)
+    max_episode_steps = getattr(args, 'max_episode_steps', 500)
+    env = make_neurogym_env(args.env_name, max_episode_steps=max_episode_steps)
+    print(f"Max episode steps: {max_episode_steps}")
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
     print(f"Algorithm: DQN (Deep Q-Network) with Trial-Based Replay")
     print(f"Environment: {args.env_name}")
     print(f"Observation dim: {obs_dim}, Action dim: {action_dim}")
-    print(f"MPN: hidden_dim={args.hidden_dim}, eta={args.eta}, lambda={args.lambda_decay}\n")
+    print(f"MPN: hidden_dim={args.hidden_dim}, eta={args.eta}, lambda={args.lambda_decay}")
+    print(f"Plasticity frozen: {args.freeze_plasticity}\n")
 
-    print("[DEBUG] Creating networks...")
     # Create networks
     online_dqn = MPNDQN(
         obs_dim=obs_dim,
@@ -303,70 +367,76 @@ def train_neurogym(args):
         action_dim=action_dim,
         eta=args.eta,
         lambda_decay=args.lambda_decay,
-        activation=args.activation
+        activation=args.activation,
+        freeze_plasticity=args.freeze_plasticity
     ).to(device)
 
-    print("[DEBUG] Creating target network...")
     target_dqn = MPNDQN(
         obs_dim=obs_dim,
         hidden_dim=args.hidden_dim,
         action_dim=action_dim,
         eta=args.eta,
         lambda_decay=args.lambda_decay,
-        activation=args.activation
+        activation=args.activation,
+        freeze_plasticity=args.freeze_plasticity
     ).to(device)
     target_dqn.load_state_dict(online_dqn.state_dict())
 
-    print("[DEBUG] Creating optimizer...")
     # Optimizer
     optimizer = torch.optim.Adam(online_dqn.parameters(), lr=args.learning_rate)
 
-    print("[DEBUG] Creating trial replay buffer...")
-    # Trial replay buffer
-    trial_buffer = TrialReplayBuffer(capacity=args.buffer_size)
+    # Sequence replay buffer
+    replay_buffer = SequenceReplayBuffer(
+        capacity=args.buffer_size * 100,  # Store more transitions for sequence sampling
+        sequence_length=args.sequence_length
+    )
+    batch_size = args.sequence_batch_size
+    print(f"SequenceReplayBuffer: L={args.sequence_length}, batch={batch_size}, capacity={args.buffer_size * 100}")
 
-    print("[DEBUG] Setting up visualization...")
     # Visualization
-    viz = TrainingVisualizer() if args.plot_training else None
+    viz = TrainingVisualizer()
 
     # Training loop
-    epsilon = args.epsilon_start
     best_avg_reward = -float('inf')
+    total_training_steps = 0  # Track training steps for target network updates
+    total_env_steps = 0  # Track total environment steps
+    train_freq = getattr(args, 'train_freq', 1)
 
-    print("[DEBUG] Entering training loop...")
+    print(f"Epsilon decay: {args.epsilon_decay_type} (ε: {args.epsilon_start} → {args.epsilon_end} in 30% of episodes)")
     print("Starting training...")
     print("-"*60)
 
     for episode in range(args.num_episodes):
-        print(f"[DEBUG] Episode {episode}: Resetting environment...")
+        # Compute epsilon for this episode using selected decay schedule
+        epsilon = get_epsilon(
+            episode=episode,
+            total_episodes=args.num_episodes,
+            epsilon_start=args.epsilon_start,
+            epsilon_end=args.epsilon_end,
+            decay_type=args.epsilon_decay_type,
+            decay_param=getattr(args, 'epsilon_decay_param', None)
+        )
+
         # Reset environment and state
         obs, info = env.reset()
-        print(f"[DEBUG] Episode {episode}: Environment reset complete")
         obs = torch.FloatTensor(obs).to(device)
-        print(f"[DEBUG] Episode {episode}: Initializing MPN state...")
-        state = online_dqn.init_state(batch_size=1, device=device)
-        print(f"[DEBUG] Episode {episode}: MPN state initialized")
+        # Initialize MPN state ONCE per episode (persists across trials)
+        episode_state = online_dqn.init_state(batch_size=1, device=device)
 
         episode_reward = 0
         episode_length = 0
         episode_losses = []
-
-        # Trial collection lists
-        trial_obs_list = []
-        trial_action_list = []
-        trial_reward_list = []
-        trial_done_list = []
+        num_trials_detected = 0  # Track trial boundaries
 
         # Safety counter to prevent infinite loops
-        max_trial_steps = 1000  # Safety limit (typical trial is 10-30 steps)
+        max_trial_steps = 1000  # Safety limit
         trial_step_counter = 0
 
-        # Trial loop
-        print(f"[DEBUG] Episode {episode}: Entering trial loop...")
+        # Episode loop (processes multiple trials)
         while True:
             # Select action
             with torch.no_grad():
-                q_values, next_state = online_dqn(obs.unsqueeze(0), state)
+                q_values, next_state = online_dqn(obs.unsqueeze(0), episode_state)
 
                 if np.random.random() < epsilon:
                     action = env.action_space.sample()
@@ -378,78 +448,56 @@ def train_neurogym(args):
             done = terminated or truncated
             next_obs = torch.FloatTensor(next_obs).to(device)
 
-            # Store transition in trial lists (on CPU to save memory)
-            trial_obs_list.append(obs.cpu())
-            trial_action_list.append(action)
-            trial_reward_list.append(reward)
-            trial_done_list.append(done)
+            # Store transition with episode ID for sequence replay
+            replay_buffer.push(obs, action, reward, next_obs, done, episode)
 
-            # Update state
+            # Update observation and state (STATE PERSISTS ACROSS TRIALS!)
             obs = next_obs
-            state = next_state
+            episode_state = next_state
             episode_reward += reward
             episode_length += 1
             trial_step_counter += 1
+            total_env_steps += 1
 
-            # Safety check: force trial end if it's taking too long
+            # Safety check: force episode end if trial is taking too long
             if trial_step_counter >= max_trial_steps:
-                print(f"\n⚠️  Warning: Trial exceeded {max_trial_steps} steps, forcing end (episode {episode})")
-                # Push current trial if it has data
-                if len(trial_obs_list) > 0:
-                    trial_buffer.push_trial(
-                        trial_obs_list,
-                        trial_action_list,
-                        trial_reward_list,
-                        trial_done_list
-                    )
-                # Force episode end
+                print(f"\n⚠️  Warning: Trial exceeded {max_trial_steps} steps, forcing episode end (episode {episode})")
                 done = True
                 break
 
-            # Check for trial boundary
-            if info.get('new_trial', False) or done:
-                # Trial complete - push to buffer
-                trial_buffer.push_trial(
-                    trial_obs_list,
-                    trial_action_list,
-                    trial_reward_list,
-                    trial_done_list
-                )
-
-                # Reset trial lists and counter
-                trial_obs_list = []
-                trial_action_list = []
-                trial_reward_list = []
-                trial_done_list = []
+            # Check for trial boundary (reset counter but don't reset state)
+            if info.get('new_trial', False):
+                num_trials_detected += 1
                 trial_step_counter = 0
 
-                # Reset MPN state for new trial
-                state = online_dqn.init_state(batch_size=1, device=device)
+            # Train on batches (only every train_freq steps for efficiency)
+            if len(replay_buffer) >= batch_size and total_env_steps % train_freq == 0:
+                # Sample fixed-length sequences
+                sequences = replay_buffer.sample(batch_size)
+                if sequences:  # Check if we got sequences
+                    loss = compute_td_loss_sequences(
+                        online_dqn, target_dqn, sequences,
+                        args.gamma, device=device
+                    )
 
-            # Train on trial batches
-            if len(trial_buffer) >= args.trial_batch_size:
-                trial_batch = trial_buffer.sample(args.trial_batch_size)
-                loss = compute_td_loss_trial(
-                    online_dqn, target_dqn, trial_batch,
-                    args.gamma, device=device
-                )
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(online_dqn.parameters(), args.grad_clip)
+                    optimizer.step()
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(online_dqn.parameters(), args.grad_clip)
-                optimizer.step()
+                    episode_losses.append(loss.item())
+                    total_training_steps += 1
 
-                episode_losses.append(loss.item())
+                    # Update target network by training steps (not episodes)
+                    if total_training_steps % args.target_update_freq == 0:
+                        target_dqn.load_state_dict(online_dqn.state_dict())
 
             if done:
+                # Episode ended
                 break
 
-        # Decay epsilon
-        epsilon = max(args.epsilon_end, epsilon * args.epsilon_decay)
-
-        # Update target network
-        if episode % args.target_update_freq == 0:
-            target_dqn.load_state_dict(online_dqn.state_dict())
+        # Epsilon is computed at the start of each episode using the decay schedule
+        # (no manual decay needed here)
 
         # Track metrics
         avg_loss = np.mean(episode_losses) if episode_losses else 0.0
@@ -481,9 +529,11 @@ def train_neurogym(args):
             print(f"Ep {episode:5d}/{args.num_episodes} | "
                   f"Reward: {avg_reward:7.2f} | "
                   f"Len: {episode_length:4d} | "
+                  f"Trials: {num_trials_detected:3d} | "
                   f"Loss: {avg_loss:6.4f} | "
                   f"ε: {epsilon:.3f} | "
-                  f"Trials: {len(trial_buffer):5d}")
+                  f"Steps: {total_training_steps:6d} | "
+                  f"Buffer: {len(replay_buffer):6d}")
 
     # Save final model
     history = exp_manager.load_training_history()
@@ -1059,7 +1109,6 @@ def analyze_agent(args):
 
 
 def main():
-    print("[DEBUG MAIN] Starting main() function")
     parser = argparse.ArgumentParser(description="MPN-DQN: Multi-Plasticity Network with Deep Q-Learning")
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
 
@@ -1092,23 +1141,38 @@ def main():
     train_ng_parser.add_argument('--experiment-name', type=str, default=None, help='Experiment name (random if not provided)')
     train_ng_parser.add_argument('--env-name', type=str, default='ContextDecisionMaking-v0',
                                  help='NeuroGym environment name (default: ContextDecisionMaking-v0)')
+    train_ng_parser.add_argument('--max-episode-steps', type=int, default=500,
+                                 help='Maximum steps per episode (default: 500, NeuroGym envs dont terminate naturally)')
     train_ng_parser.add_argument('--num-episodes', type=int, default=1000, help='Number of training episodes')
     train_ng_parser.add_argument('--hidden-dim', type=int, default=128, help='MPN hidden dimension')
     train_ng_parser.add_argument('--eta', type=float, default=0.1, help='Hebbian learning rate')
     train_ng_parser.add_argument('--lambda-decay', type=float, default=0.95, help='M matrix decay factor')
     train_ng_parser.add_argument('--activation', type=str, default='tanh', choices=['relu', 'tanh', 'sigmoid'], help='MPN activation')
+    train_ng_parser.add_argument('--freeze-plasticity', action='store_true',
+                                 help='Freeze M matrix at zero (disable Hebbian plasticity) for ablation study')
     train_ng_parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
-    train_ng_parser.add_argument('--epsilon-start', type=float, default=0.3, help='Initial exploration rate')
-    train_ng_parser.add_argument('--epsilon-end', type=float, default=0.01, help='Final exploration rate')
-    train_ng_parser.add_argument('--epsilon-decay', type=float, default=0.995, help='Epsilon decay per episode')
-    train_ng_parser.add_argument('--trial-batch-size', type=int, default=4, help='Number of trials per batch')
-    train_ng_parser.add_argument('--buffer-size', type=int, default=500, help='Trial replay buffer size (number of trials)')
-    train_ng_parser.add_argument('--learning-rate', type=float, default=1e-3, help='Learning rate')
+
+    # Epsilon (exploration) parameters
+    train_ng_parser.add_argument('--epsilon-start', type=float, default=1.0, help='Initial exploration rate (default: 1.0 for full exploration)')
+    train_ng_parser.add_argument('--epsilon-end', type=float, default=0.01, help='Final/minimum exploration rate (default: 0.01)')
+    train_ng_parser.add_argument('--epsilon-decay-type', type=str, default='linear',
+                                 choices=['linear', 'exponential', 'step'],
+                                 help='Epsilon decay schedule type (default: linear). All reach epsilon_end in 30%% of episodes')
+
+    # Sequence replay buffer parameters
+    train_ng_parser.add_argument('--buffer-size', type=int, default=500, help='Replay buffer base size (actual capacity will be buffer_size * 100 transitions)')
+    train_ng_parser.add_argument('--sequence-length', type=int, default=10,
+                                 help='Fixed sequence length L (default: 10, paper uses 16)')
+    train_ng_parser.add_argument('--sequence-batch-size', type=int, default=32,
+                                 help='Number of sequences per batch (default: 32)')
+    train_ng_parser.add_argument('--train-freq', type=int, default=1,
+                                 help='Train every N environment steps (default: 1)')
+
+    train_ng_parser.add_argument('--learning-rate', type=float, default=0.00025, help='Learning rate (DRQN paper: 0.00025)')
     train_ng_parser.add_argument('--grad-clip', type=float, default=10.0, help='Gradient clipping')
-    train_ng_parser.add_argument('--target-update-freq', type=int, default=10, help='Target network update frequency (episodes)')
+    train_ng_parser.add_argument('--target-update-freq', type=int, default=10000, help='Target network update frequency in training steps (DRQN paper: 10000)')
     train_ng_parser.add_argument('--checkpoint-freq', type=int, default=50, help='Checkpoint save frequency (episodes)')
     train_ng_parser.add_argument('--print-freq', type=int, default=10, help='Print frequency (episodes)')
-    train_ng_parser.add_argument('--plot-training', action='store_true', help='Plot training curves')
     train_ng_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
 
     # Resume command
@@ -1158,15 +1222,11 @@ def main():
     analyze_plot_parser.add_argument('--color-feature', type=int, default=0,
                                help='CartPole feature for coloring (0=pos, 1=vel, 2=angle, 3=ang_vel)')
 
-    print("[DEBUG MAIN] Parsing arguments...")
     args = parser.parse_args()
-    print(f"[DEBUG MAIN] Arguments parsed. Command: {args.command}")
 
     if args.command == 'train':
-        print("[DEBUG MAIN] Calling train()")
         train(args)
     elif args.command == 'train-neurogym':
-        print("[DEBUG MAIN] Calling train_neurogym()")
         train_neurogym(args)
     elif args.command == 'resume':
         resume_training(args)

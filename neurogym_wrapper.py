@@ -166,20 +166,23 @@ class NeuroGymWrapper(gym.Wrapper):
         return f"NeuroGymWrapper({self.env})"
 
 
-def make_neurogym_env(env_name, **kwargs):
+def make_neurogym_env(env_name, max_episode_steps=500, **kwargs):
     """
     Convenience function to create a wrapped NeuroGym environment.
 
     Args:
         env_name: Name of NeuroGym environment (e.g., 'ContextDecisionMaking-v0')
+        max_episode_steps: Maximum steps per episode (default: 500). NeuroGym
+                          environments don't terminate naturally, so we apply a
+                          TimeLimit wrapper.
         **kwargs: Additional arguments to pass to neurogym.make()
 
     Returns:
-        NeuroGymWrapper: Wrapped environment
+        Wrapped environment with trial tracking and time limit
 
     Examples:
         >>> env = make_neurogym_env('ContextDecisionMaking-v0')
-        >>> env = make_neurogym_env('DelayMatchSample-v0', dt=100)
+        >>> env = make_neurogym_env('DelayMatchSample-v0', max_episode_steps=1000)
     """
     try:
         import neurogym as ngym
@@ -189,8 +192,13 @@ def make_neurogym_env(env_name, **kwargs):
     # Create NeuroGym environment
     ngym_env = ngym.make(env_name, **kwargs)
 
-    # Wrap with our wrapper
+    # Wrap with our wrapper for observation flattening and trial tracking
     wrapped_env = NeuroGymWrapper(ngym_env, flatten_obs=True)
+
+    # IMPORTANT: NeuroGym environments don't terminate naturally!
+    # Apply TimeLimit wrapper to ensure episodes end
+    from gymnasium.wrappers import TimeLimit
+    wrapped_env = TimeLimit(wrapped_env, max_episode_steps=max_episode_steps)
 
     return wrapped_env
 
