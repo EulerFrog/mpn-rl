@@ -2,18 +2,18 @@
 Main CLI for MPN-DQN training, evaluation, and rendering
 
 Commands:
-    train   - Train a new MPN-DQN agent
-    resume  - Resume training from checkpoint
-    eval    - Evaluate a trained agent
-    render  - Render episode(s) to GIF
-    analyze - Analyze agent with PCA on hidden states and M matrices
+    train-neurogym - Train a new MPN-DQN agent on NeuroGym environments
+    resume         - Resume training from checkpoint
+    eval           - Evaluate a trained agent
+    render         - Render episode(s) to GIF
+    analyze        - Analyze agent with PCA on hidden states and M matrices
 
 Examples:
-    # Train with default settings
-    python main.py train
+    # Train on NeuroGym with default settings
+    python main.py train-neurogym
 
     # Train with custom hyperparameters
-    python main.py train --experiment-name my-agent --num-episodes 1000 --eta 0.1
+    python main.py train-neurogym --experiment-name my-agent --num-episodes 1000 --eta 0.1
 
     # Resume training
     python main.py resume --experiment-name my-agent --num-episodes 500
@@ -38,6 +38,7 @@ from pathlib import Path
 
 # MPN-DQN imports
 from mpn_dqn import MPNDQN
+from rnn_dqn import RNNDQN
 from model_utils import (ExperimentManager, save_checkpoint, load_checkpoint_for_eval,
                          load_checkpoint_for_resume, ReplayBuffer, compute_td_loss,
                          TrialReplayBuffer, compute_td_loss_trial,
@@ -144,189 +145,6 @@ def get_device(device_str='auto'):
     return device
 
 
-def train(args):
-    """Train MPN-DQN agent."""
-    print("="*60)
-    print("Training MPN-DQN")
-    print("="*60)
-
-    # Create experiment manager
-    exp_manager = ExperimentManager(args.experiment_name)
-    print(f"Experiment: {exp_manager.experiment_name}")
-    print(f"Directory: {exp_manager.exp_dir}\n")
-
-    # Save configuration
-    config = vars(args)
-    exp_manager.save_config(config)
-
-    # Setup device (GPU/CPU)
-    device = get_device(args.device)
-    print()
-
-    # Create environment
-    env = gym.make(args.env_name,
-                   render_mode=None,
-                   max_episode_steps=args.max_episode_steps)
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-
-    print(f"Algorithm: DQN (Deep Q-Network)")
-    print(f"Environment: {args.env_name}")
-    print(f"Observation dim: {obs_dim}, Action dim: {action_dim}")
-    print(f"Max episode steps: {args.max_episode_steps}")
-    print(f"MPN: hidden_dim={args.hidden_dim}, eta={args.eta}, lambda={args.lambda_decay}\n")
-
-    # Create networks
-    online_dqn = MPNDQN(
-        obs_dim=obs_dim,
-        hidden_dim=args.hidden_dim,
-        action_dim=action_dim,
-        eta=args.eta,
-        lambda_decay=args.lambda_decay,
-        activation=args.activation
-    ).to(device)
-
-    target_dqn = MPNDQN(
-        obs_dim=obs_dim,
-        hidden_dim=args.hidden_dim,
-        action_dim=action_dim,
-        eta=args.eta,
-        lambda_decay=args.lambda_decay,
-        activation=args.activation
-    ).to(device)
-    target_dqn.load_state_dict(online_dqn.state_dict())
-
-    # Optimizer
-    optimizer = torch.optim.Adam(online_dqn.parameters(), lr=args.learning_rate)
-
-    # Replay buffer
-    replay_buffer = ReplayBuffer(capacity=args.buffer_size)
-
-    # Visualization
-    viz = TrainingVisualizer()
-
-    # Training loop
-    epsilon = args.epsilon_start
-    best_avg_reward = -float('inf')
-
-    print("Starting training...")
-    print("-"*60)
-
-    for episode in range(args.num_episodes):
-        # Reset environment and state
-        obs, _ = env.reset() if isinstance(env.reset(), tuple) else (env.reset(), {})
-        obs = torch.FloatTensor(obs).to(device)
-        state = online_dqn.init_state(batch_size=1, device=device)
-
-        episode_reward = 0
-        episode_length = 0
-        episode_losses = []
-
-        # Episode loop
-        while True:
-            # Select action
-            with torch.no_grad():
-                q_values, next_state = online_dqn(obs.unsqueeze(0), state)
-
-                if np.random.random() < epsilon:
-                    action = env.action_space.sample()
-                else:
-                    action = q_values.argmax(dim=1).item()
-
-            # Take step
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            next_obs = torch.FloatTensor(next_obs).to(device)
-
-            # Store experience (store on CPU to save GPU memory)
-            replay_buffer.push(
-                obs.cpu(), action, reward, next_obs.cpu(), done,
-                state.squeeze(0).cpu(), next_state.squeeze(0).cpu()
-            )
-
-            # Update state
-            obs = next_obs
-            state = next_state
-            episode_reward += reward
-            episode_length += 1
-
-            # Train
-            if len(replay_buffer) >= args.batch_size:
-                batch = replay_buffer.sample(args.batch_size)
-                # Move batch to device
-                batch = tuple(b.to(device) if isinstance(b, torch.Tensor) else b for b in batch)
-                loss = compute_td_loss(online_dqn, target_dqn, batch, args.gamma)
-
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(online_dqn.parameters(), args.grad_clip)
-                optimizer.step()
-
-                episode_losses.append(loss.item())
-
-            if done:
-                break
-
-        # Decay epsilon
-        epsilon = max(args.epsilon_end, epsilon * args.epsilon_decay)
-
-        # Update target network
-        if episode % args.target_update_freq == 0:
-            target_dqn.load_state_dict(online_dqn.state_dict())
-
-        # Track metrics
-        avg_loss = np.mean(episode_losses) if episode_losses else 0.0
-        exp_manager.append_training_history(episode, episode_reward, episode_length, avg_loss, epsilon)
-
-        # Update visualization
-        if viz is not None:
-            viz.update(episode=episode, episode_reward=episode_reward,
-                      episode_length=episode_length, loss=avg_loss, epsilon=epsilon)
-
-        # Checkpoint
-        if episode % args.checkpoint_freq == 0 and episode > 0:
-            # Calculate average reward over last window
-            history = exp_manager.load_training_history()
-            recent_rewards = history['rewards'][-args.checkpoint_freq:]
-            avg_reward = np.mean(recent_rewards)
-
-            is_best = avg_reward > best_avg_reward
-            if is_best:
-                best_avg_reward = avg_reward
-
-            save_checkpoint(exp_manager, online_dqn, optimizer, episode, avg_reward, is_best=is_best)
-
-        # Print progress
-        if episode % args.print_freq == 0:
-            history = exp_manager.load_training_history()
-            recent_rewards = history['rewards'][-args.print_freq:]
-            avg_reward = np.mean(recent_rewards)
-            print(f"Ep {episode:5d}/{args.num_episodes} | "
-                  f"Reward: {avg_reward:7.2f} | "
-                  f"Len: {episode_length:4d} | "
-                  f"Loss: {avg_loss:6.4f} | "
-                  f"ε: {epsilon:.3f} | "
-                  f"Buffer: {len(replay_buffer):5d}")
-
-    # Save final model
-    history = exp_manager.load_training_history()
-    final_avg_reward = np.mean(history['rewards'][-10:])
-    save_checkpoint(exp_manager, online_dqn, optimizer, args.num_episodes,
-                   final_avg_reward, is_best=False, is_final=True)
-
-    # Plot training curves
-    plot_path = exp_manager.plot_dir / "training_curves.png"
-    viz.plot(save_path=str(plot_path))
-
-    env.close()
-    print("\n" + "="*60)
-    print("Training completed!")
-    print(f"Final avg reward: {final_avg_reward:.2f}")
-    print(f"Best avg reward: {best_avg_reward:.2f}")
-    print(f"Results saved to: {exp_manager.exp_dir}")
-    print("="*60)
-
-
 def train_neurogym(args):
     """Train MPN-DQN on NeuroGym environment with sequence replay."""
     print("="*60)
@@ -354,32 +172,60 @@ def train_neurogym(args):
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
-    print(f"Algorithm: DQN (Deep Q-Network) with Trial-Based Replay")
+    # Determine model configuration based on model_type
+    model_type = args.model_type
+    freeze_plasticity = (model_type == 'mpn-frozen')
+    use_rnn = (model_type == 'rnn')
+
+    print(f"Algorithm: DQN (Deep Q-Network) with Sequence Replay")
+    print(f"Model type: {model_type.upper()}")
     print(f"Environment: {args.env_name}")
     print(f"Observation dim: {obs_dim}, Action dim: {action_dim}")
-    print(f"MPN: hidden_dim={args.hidden_dim}, eta={args.eta}, lambda={args.lambda_decay}")
-    print(f"Plasticity frozen: {args.freeze_plasticity}\n")
 
-    # Create networks
-    online_dqn = MPNDQN(
-        obs_dim=obs_dim,
-        hidden_dim=args.hidden_dim,
-        action_dim=action_dim,
-        eta=args.eta,
-        lambda_decay=args.lambda_decay,
-        activation=args.activation,
-        freeze_plasticity=args.freeze_plasticity
-    ).to(device)
+    if use_rnn:
+        print(f"RNN: hidden_dim={args.hidden_dim}, activation={args.activation}\n")
+    else:
+        print(f"MPN: hidden_dim={args.hidden_dim}, eta={args.eta}, lambda={args.lambda_decay}")
+        print(f"Plasticity frozen: {freeze_plasticity}\n")
 
-    target_dqn = MPNDQN(
-        obs_dim=obs_dim,
-        hidden_dim=args.hidden_dim,
-        action_dim=action_dim,
-        eta=args.eta,
-        lambda_decay=args.lambda_decay,
-        activation=args.activation,
-        freeze_plasticity=args.freeze_plasticity
-    ).to(device)
+    # Create networks based on model type
+    if use_rnn:
+        # Use vanilla RNN
+        online_dqn = RNNDQN(
+            obs_dim=obs_dim,
+            hidden_dim=args.hidden_dim,
+            action_dim=action_dim,
+            activation=args.activation,
+        ).to(device)
+
+        target_dqn = RNNDQN(
+            obs_dim=obs_dim,
+            hidden_dim=args.hidden_dim,
+            action_dim=action_dim,
+            activation=args.activation,
+        ).to(device)
+    else:
+        # Use MPN (with or without plasticity)
+        online_dqn = MPNDQN(
+            obs_dim=obs_dim,
+            hidden_dim=args.hidden_dim,
+            action_dim=action_dim,
+            eta=args.eta,
+            lambda_decay=args.lambda_decay,
+            activation=args.activation,
+            freeze_plasticity=freeze_plasticity
+        ).to(device)
+
+        target_dqn = MPNDQN(
+            obs_dim=obs_dim,
+            hidden_dim=args.hidden_dim,
+            action_dim=action_dim,
+            eta=args.eta,
+            lambda_decay=args.lambda_decay,
+            activation=args.activation,
+            freeze_plasticity=freeze_plasticity
+        ).to(device)
+
     target_dqn.load_state_dict(online_dqn.state_dict())
 
     # Optimizer
@@ -625,17 +471,31 @@ def resume_training(args):
 def evaluate(args):
     """Evaluate trained agent."""
     print("="*60)
-    print("Evaluating MPN-DQN")
+    print("Evaluating Agent")
     print("="*60)
 
     # Load experiment
     exp_manager = ExperimentManager(args.experiment_name)
     config = exp_manager.load_config()
 
-    # Create environment
+    # Detect model type from config
+    model_type = config.get('model_type', 'mpn')  # Default to 'mpn' for backward compatibility
+    use_rnn = (model_type == 'rnn')
+    freeze_plasticity = (model_type == 'mpn-frozen')
+
+    print(f"Model type: {model_type.upper()}")
+
+    # Create environment (handle both Gym and NeuroGym)
+    env_name = config['env_name']
+    is_neurogym = (config.get('command') == 'train-neurogym')
     render_mode = 'rgb_array' if args.render else None
-    env = gym.make(config['env_name'], render_mode=render_mode,
-                   max_episode_steps=args.max_episode_steps)
+
+    if is_neurogym:
+        env = make_neurogym_env(env_name, max_episode_steps=args.max_episode_steps)
+    else:
+        env = gym.make(env_name, render_mode=render_mode,
+                       max_episode_steps=args.max_episode_steps)
+
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
@@ -643,15 +503,24 @@ def evaluate(args):
     device = get_device(args.device)
     print()
 
-    # Create model
-    dqn = MPNDQN(
-        obs_dim=obs_dim,
-        hidden_dim=config['hidden_dim'],
-        action_dim=action_dim,
-        eta=config['eta'],
-        lambda_decay=config['lambda_decay'],
-        activation=config.get('activation', 'tanh')
-    ).to(device)
+    # Create model based on type
+    if use_rnn:
+        dqn = RNNDQN(
+            obs_dim=obs_dim,
+            hidden_dim=config['hidden_dim'],
+            action_dim=action_dim,
+            activation=config.get('activation', 'tanh')
+        ).to(device)
+    else:
+        dqn = MPNDQN(
+            obs_dim=obs_dim,
+            hidden_dim=config['hidden_dim'],
+            action_dim=action_dim,
+            eta=config.get('eta', 0.1),
+            lambda_decay=config.get('lambda_decay', 0.95),
+            activation=config.get('activation', 'tanh'),
+            freeze_plasticity=freeze_plasticity
+        ).to(device)
 
     # Load checkpoint
     checkpoint_name = args.checkpoint if args.checkpoint else "best_model.pt"
@@ -704,12 +573,19 @@ def evaluate(args):
 def render_to_gif(args):
     """Render episode to GIF."""
     print("="*60)
-    print("Rendering MPN-DQN to GIF")
+    print("Rendering Agent to GIF")
     print("="*60)
 
     # Load experiment
     exp_manager = ExperimentManager(args.experiment_name)
     config = exp_manager.load_config()
+
+    # Detect model type from config
+    model_type = config.get('model_type', 'mpn')  # Default to 'mpn' for backward compatibility
+    use_rnn = (model_type == 'rnn')
+    freeze_plasticity = (model_type == 'mpn-frozen')
+
+    print(f"Model type: {model_type.upper()}")
 
     # Determine output path (default to videos directory if not specified)
     if args.output is None:
@@ -717,9 +593,16 @@ def render_to_gif(args):
     else:
         output_path = args.output
 
-    # Create environment
-    env = gym.make(config['env_name'], render_mode='rgb_array',
-                   max_episode_steps=args.max_episode_steps)
+    # Create environment (handle both Gym and NeuroGym)
+    env_name = config['env_name']
+    is_neurogym = (config.get('command') == 'train-neurogym')
+
+    if is_neurogym:
+        env = make_neurogym_env(env_name, max_episode_steps=args.max_episode_steps)
+    else:
+        env = gym.make(env_name, render_mode='rgb_array',
+                       max_episode_steps=args.max_episode_steps)
+
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
@@ -728,15 +611,24 @@ def render_to_gif(args):
     print("Using CPU for rendering")
     print()
 
-    # Create model
-    dqn = MPNDQN(
-        obs_dim=obs_dim,
-        hidden_dim=config['hidden_dim'],
-        action_dim=action_dim,
-        eta=config['eta'],
-        lambda_decay=config['lambda_decay'],
-        activation=config.get('activation', 'tanh')
-    ).to(device)
+    # Create model based on type
+    if use_rnn:
+        dqn = RNNDQN(
+            obs_dim=obs_dim,
+            hidden_dim=config['hidden_dim'],
+            action_dim=action_dim,
+            activation=config.get('activation', 'tanh')
+        ).to(device)
+    else:
+        dqn = MPNDQN(
+            obs_dim=obs_dim,
+            hidden_dim=config['hidden_dim'],
+            action_dim=action_dim,
+            eta=config.get('eta', 0.1),
+            lambda_decay=config.get('lambda_decay', 0.95),
+            activation=config.get('activation', 'tanh'),
+            freeze_plasticity=freeze_plasticity
+        ).to(device)
 
     # Load checkpoint
     checkpoint_name = args.checkpoint if args.checkpoint else "best_model.pt"
@@ -749,13 +641,31 @@ def render_to_gif(args):
     print(f"Max episode steps: {args.max_episode_steps}")
     print(f"Rendering to: {output_path}\n")
 
-    # Render
-    reward = render_episode_to_gif(dqn, env, str(output_path), max_steps=args.max_episode_steps, fps=args.fps)
+    # Render - use different function for NeuroGym
+    if is_neurogym:
+        from render_utils import render_neurogym_episode
+        # Change output extension to .png for NeuroGym static plots
+        if str(output_path).endswith('.gif'):
+            output_path = str(output_path).replace('.gif', '.png')
+        reward, episode_data = render_neurogym_episode(
+            dqn, env, str(output_path),
+            max_steps=args.max_episode_steps,
+            seed=args.seed
+        )
+    else:
+        reward = render_episode_to_gif(
+            dqn, env, str(output_path),
+            max_steps=args.max_episode_steps,
+            fps=args.fps
+        )
 
     env.close()
 
     print(f"\nRendering completed! Episode reward: {reward:.2f}")
-    print(f"GIF saved to: {output_path}")
+    if is_neurogym:
+        print(f"Plot saved to: {output_path}")
+    else:
+        print(f"GIF saved to: {output_path}")
 
 
 def analyze_collect(args):
@@ -1112,30 +1022,6 @@ def main():
     parser = argparse.ArgumentParser(description="MPN-DQN: Multi-Plasticity Network with Deep Q-Learning")
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
 
-    # Train command
-    train_parser = subparsers.add_parser('train', help='Train a new agent on Gymnasium environment')
-    train_parser.add_argument('--experiment-name', type=str, default=None, help='Experiment name (random if not provided)')
-    train_parser.add_argument('--env-name', type=str, default='CartPole-v1', help='Gym environment name')
-    train_parser.add_argument('--max-episode-steps', type=int, default=2000, help='Maximum steps per episode (default: 2000)')
-    train_parser.add_argument('--num-episodes', type=int, default=500, help='Number of training episodes')
-    train_parser.add_argument('--hidden-dim', type=int, default=64, help='MPN hidden dimension')
-    train_parser.add_argument('--eta', type=float, default=0.05, help='Hebbian learning rate')
-    train_parser.add_argument('--lambda-decay', type=float, default=0.9, help='M matrix decay factor')
-    train_parser.add_argument('--activation', type=str, default='tanh', choices=['relu', 'tanh', 'sigmoid'], help='MPN activation')
-    train_parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
-    train_parser.add_argument('--epsilon-start', type=float, default=1.0, help='Initial exploration rate')
-    train_parser.add_argument('--epsilon-end', type=float, default=0.01, help='Final exploration rate')
-    train_parser.add_argument('--epsilon-decay', type=float, default=0.995, help='Epsilon decay per episode')
-    train_parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
-    train_parser.add_argument('--buffer-size', type=int, default=10000, help='Replay buffer size')
-    train_parser.add_argument('--learning-rate', type=float, default=1e-3, help='Learning rate')
-    train_parser.add_argument('--grad-clip', type=float, default=10.0, help='Gradient clipping')
-    train_parser.add_argument('--target-update-freq', type=int, default=10, help='Target network update frequency (episodes)')
-    train_parser.add_argument('--checkpoint-freq', type=int, default=50, help='Checkpoint save frequency (episodes)')
-    train_parser.add_argument('--print-freq', type=int, default=10, help='Print frequency (episodes)')
-    train_parser.add_argument('--plot-training', action='store_true', help='Plot training curves')
-    train_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
-
     # Train NeuroGym command
     train_ng_parser = subparsers.add_parser('train-neurogym', help='Train on NeuroGym environment with trial-based replay')
     train_ng_parser.add_argument('--experiment-name', type=str, default=None, help='Experiment name (random if not provided)')
@@ -1144,12 +1030,13 @@ def main():
     train_ng_parser.add_argument('--max-episode-steps', type=int, default=500,
                                  help='Maximum steps per episode (default: 500, NeuroGym envs dont terminate naturally)')
     train_ng_parser.add_argument('--num-episodes', type=int, default=1000, help='Number of training episodes')
-    train_ng_parser.add_argument('--hidden-dim', type=int, default=128, help='MPN hidden dimension')
-    train_ng_parser.add_argument('--eta', type=float, default=0.1, help='Hebbian learning rate')
-    train_ng_parser.add_argument('--lambda-decay', type=float, default=0.95, help='M matrix decay factor')
-    train_ng_parser.add_argument('--activation', type=str, default='tanh', choices=['relu', 'tanh', 'sigmoid'], help='MPN activation')
-    train_ng_parser.add_argument('--freeze-plasticity', action='store_true',
-                                 help='Freeze M matrix at zero (disable Hebbian plasticity) for ablation study')
+    train_ng_parser.add_argument('--model-type', type=str, default='mpn',
+                                 choices=['mpn', 'mpn-frozen', 'rnn'],
+                                 help='Model type: mpn (with plasticity), mpn-frozen (no plasticity), rnn (vanilla RNN baseline)')
+    train_ng_parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension for recurrent layer')
+    train_ng_parser.add_argument('--eta', type=float, default=0.1, help='Hebbian learning rate (MPN only)')
+    train_ng_parser.add_argument('--lambda-decay', type=float, default=0.95, help='M matrix decay factor (MPN only)')
+    train_ng_parser.add_argument('--activation', type=str, default='tanh', choices=['relu', 'tanh', 'sigmoid'], help='Activation function')
     train_ng_parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
 
     # Epsilon (exploration) parameters
@@ -1198,6 +1085,7 @@ def main():
     render_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load (default: best_model.pt)')
     render_parser.add_argument('--max-episode-steps', type=int, default=2000, help='Maximum steps per episode (default: 2000)')
     render_parser.add_argument('--fps', type=int, default=30, help='Frames per second')
+    render_parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility')
 
     # Analyze command with subcommands
     analyze_parser = subparsers.add_parser('analyze', help='Analyze agent with PCA')
@@ -1224,9 +1112,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == 'train':
-        train(args)
-    elif args.command == 'train-neurogym':
+    if args.command == 'train-neurogym':
         train_neurogym(args)
     elif args.command == 'resume':
         resume_training(args)

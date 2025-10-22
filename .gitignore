@@ -62,3 +62,6 @@ Thumbs.db
 test_*.gif
 test_*.png
 *.pdf
+
+condor
+.claude

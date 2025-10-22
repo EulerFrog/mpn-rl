@@ -1,20 +1,80 @@
- python3 main.py train-neurogym \
-      --sequence-length 20 \
-      --sequence-batch-size 8 \
-      --train-freq 1 \
-      --num-episodes 300 \
-      --max-episode-steps 500 \
-      --print-freq 5 \
-      --experiment-name longer-test \
-      --device cuda
+  # MPN with plasticity
+  python3 main.py train-neurogym \
+        --model-type mpn \
+        --sequence-length 20 \
+        --sequence-batch-size 8 \
+        --train-freq 1 \
+        --num-episodes 300 \
+        --max-episode-steps 500 \
+        --print-freq 5 \
+        --experiment-name longer-test-mpn \
+        --device cuda
 
- python3 main.py train-neurogym \
-      --sequence-length 20 \
-      --sequence-batch-size 8 \
-      --train-freq 1 \
-      --num-episodes 300 \
-      --max-episode-steps 500 \
-      --print-freq 5 \
-      --experiment-name longer-test-frozen \
-      --device cuda \
-      --freeze-plasticity
+  # MPN frozen (no plasticity)
+  python3 main.py train-neurogym \
+        --model-type mpn-frozen \
+        --sequence-length 20 \
+        --sequence-batch-size 8 \
+        --train-freq 1 \
+        --num-episodes 300 \
+        --max-episode-steps 500 \
+        --print-freq 5 \
+        --experiment-name longer-test-frozen \
+        --device cuda
+
+  # Vanilla RNN
+  python3 main.py train-neurogym \
+        --model-type rnn \
+        --sequence-length 20 \
+        --sequence-batch-size 8 \
+        --train-freq 1 \
+        --num-episodes 300 \
+        --max-episode-steps 500 \
+        --print-freq 5 \
+        --experiment-name longer-test-rnn \
+        --device cuda
+
+
+-------------------------
+
+python3 main.py train-neurogym \
+     --experiment-name gng-long-mpn \
+     --env-name GoNogo-v0 \
+     --max-episode-steps 500 \
+     --num-episodes 200 \
+     --model-type mpn \
+     --hidden-dim 128 \
+     --eta 0.1 \
+     --lambda-decay 0.95 \
+     --sequence-length 25 \
+     --learning-rate 0.01 \
+     --buffer-size 20 \
+     --device cuda
+
+python3 main.py train-neurogym \
+     --experiment-name gng-long-rnn \
+     --env-name GoNogo-v0 \
+     --max-episode-steps 500 \
+     --num-episodes 200 \
+     --model-type mpn \
+     --hidden-dim 128 \
+     --eta 0.1 \
+     --lambda-decay 0.95 \
+     --sequence-length 25 \
+     --learning-rate 0.01 \
+     --buffer-size 20 \
+     --device cuda
+
+python3 main.py train-neurogym \
+     --experiment-name gng-long-frozen \
+     --env-name GoNogo-v0 \
+     --max-episode-steps 500 \
+     --num-episodes 200 \
+     --model-type mpn-frozen \
+     --hidden-dim 128 \
+     --eta 0.1 \
+     --lambda-decay 0.95 \
+     --sequence-length 25 \
+     --learning-rate 0.01 \
+     --buffer-size 20 \
+     --device cuda
