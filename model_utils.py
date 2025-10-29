@@ -681,13 +681,19 @@ class ExperimentManager:
                 'rewards': [],
                 'lengths': [],
                 'losses': [],
-                'epsilons': []
+                'epsilons': [],
+                'trials': []
             }
         with open(self.history_path, 'r') as f:
-            return json.load(f)
+            history = json.load(f)
+            # Ensure 'trials' field exists for backward compatibility
+            if 'trials' not in history:
+                history['trials'] = []
+            return history
 
     def append_training_history(self, episode: int, reward: float,
-                                length: int, loss: float, epsilon: float):
+                                length: int, loss: float, epsilon: float,
+                                num_trials: int = 0):
         """Append new data to training history."""
         history = self.load_training_history()
         history['episodes'].append(episode)
@@ -695,6 +701,7 @@ class ExperimentManager:
         history['lengths'].append(length)
         history['losses'].append(loss)
         history['epsilons'].append(epsilon)
+        history['trials'].append(num_trials)
         self.save_training_history(history)
 
     def get_best_checkpoint(self) -> Optional[str]:

@@ -233,7 +233,7 @@ def train_neurogym(args):
 
     # Sequence replay buffer
     replay_buffer = SequenceReplayBuffer(
-        capacity=args.buffer_size * 100,  # Store more transitions for sequence sampling
+        capacity=args.buffer_size * 100,
         sequence_length=args.sequence_length
     )
     batch_size = args.sequence_batch_size
@@ -347,7 +347,7 @@ def train_neurogym(args):
 
         # Track metrics
         avg_loss = np.mean(episode_losses) if episode_losses else 0.0
-        exp_manager.append_training_history(episode, episode_reward, episode_length, avg_loss, epsilon)
+        exp_manager.append_training_history(episode, episode_reward, episode_length, avg_loss, epsilon, num_trials_detected)
 
         # Update visualization
         if viz is not None:

@@ -1,0 +1,21 @@
+universe = vanilla
+executable = ./condor/scripts/train_gonogo.sh
+
+# Resource requests (GPU training)
+request_cpus = 2
+request_gpus = 1
+request_memory = 8GB
+
+# Output files (organized in condor/logs)
+output = condor/logs/gonogo_$(Process).out
+error  = condor/logs/gonogo_$(Process).err
+log    = condor/logs/gonogo_$(Process).log
+
++CSCI_GrpDesktop = true
+
+max_materialize = 50
+
+# Pass arguments from args file
+# Format: MODEL_TYPE ETA LAMBDA HIDDEN_DIM NUM_EPISODES SUFFIX
+arguments = $(args)
+Queue arguments from condor/args/train_gonogo_args.txt

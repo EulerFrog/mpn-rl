@@ -53,6 +53,9 @@ data/
 # Logs
 *.log
 logs/
+.condor_logs/
+condor/logs/
+condor/outputs/
 
 # OS
 .DS_Store
@@ -63,5 +66,7 @@ test_*.gif
 test_*.png
 *.pdf
 
-condor
+# Condor temporary outputs
+dummy_*.result.txt
+
 .claude

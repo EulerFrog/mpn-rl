@@ -171,3 +171,161 @@ q_values, new_state = dqn(obs, state)
 action, new_state = dqn.select_action(obs, state, epsilon=0.1)
 ```
 
+## Running Jobs on HTCondor
+
+HTCondor allows you to run large-scale parameter sweeps and experiments across multiple machines. This is useful for hyperparameter searches and running multiple seeds in parallel.
+
+### Prerequisites
+
+1. Access to an HTCondor cluster
+2. Virtual environment set up with all dependencies installed
+3. Condor logs directory created:
+   ```bash
+   mkdir -p .condor_logs
+   ```
+
+### Basic Job Structure
+
+A Condor job consists of three components:
+
+1. **Submit file** (`*.job`) - Defines resource requirements and job parameters
+2. **Executable script** (`*.sh`) - The script that runs your experiment
+3. **Arguments file** (`*_args.txt`) - Parameter combinations for batch jobs
+
+### Example: Simple Parameter Sweep
+
+The included `dummy.job` demonstrates a basic parameter sweep:
+
+```bash
+# Submit the example job
+condor_submit dummy.job
+```
+
+This will queue 10 jobs with different parameter combinations from `dummy_args.txt`.
+
+### Creating Your Own Training Jobs
+
+1. **Create an executable script** (e.g., `train_sweep.sh`):
+   ```bash
+   #!/bin/bash
+
+   # Parse arguments
+   SEED=$1
+   ETA=$2
+   LAMBDA=$3
+   HIDDEN_DIM=$4
+   EXP_NAME=$5
+
+   # Activate virtual environment
+   source .venv/bin/activate
+
+   # Run training
+   python main.py train \
+       --experiment-name ${EXP_NAME} \
+       --seed ${SEED} \
+       --eta ${ETA} \
+       --lambda-decay ${LAMBDA} \
+       --hidden-dim ${HIDDEN_DIM} \
+       --num-episodes 1000
+   ```
+
+2. **Make it executable**:
+   ```bash
+   chmod +x train_sweep.sh
+   ```
+
+3. **Create arguments file** (`train_args.txt`):
+   ```
+   42 0.05 0.9 64 mpn_seed42_eta0.05
+   43 0.05 0.9 64 mpn_seed43_eta0.05
+   44 0.05 0.9 64 mpn_seed44_eta0.05
+   42 0.1 0.9 64 mpn_seed42_eta0.1
+   43 0.1 0.9 64 mpn_seed43_eta0.1
+   ```
+
+4. **Create submit file** (`train.job`):
+   ```
+   universe = vanilla
+   executable = ./train_sweep.sh
+
+   # Resource requests
+   request_cpus = 1
+   request_gpus = 0
+   request_memory = 4GB
+
+   # Output files
+   output = .condor_logs/train_$(Process).out
+   error  = .condor_logs/train_$(Process).err
+   log    = .condor_logs/train_$(Process).log
+
+   # Desktop group (if needed for your cluster)
+   +CSCI_GrpDesktop = true
+
+   # Limit concurrent jobs (optional)
+   max_materialize = 4
+
+   # Queue jobs from arguments file
+   arguments = $(args)
+   Queue arguments from train_args.txt
+   ```
+
+### Submitting and Managing Jobs
+
+```bash
+# Submit jobs
+condor_submit train.job
+
+# Check job status
+condor_q
+
+# Check detailed status for your jobs
+condor_q -nobatch
+
+# Monitor a specific job
+condor_q <job_id>
+
+# View job history
+condor_history
+
+# Remove all your jobs
+condor_rm <username>
+
+# Remove specific job
+condor_rm <job_id>
+
+# Check why a job is held
+condor_q -hold
+
+# Release held jobs
+condor_release <job_id>
+```
+
+### Monitoring Progress
+
+Check log files in `.condor_logs/`:
+```bash
+# View stdout from job 0
+cat .condor_logs/train_0.out
+
+# Watch logs in real-time
+tail -f .condor_logs/train_0.out
+
+# Check for errors
+cat .condor_logs/train_0.err
+```
+
+### Resource Guidelines
+
+- **CPU-only training**: `request_cpus = 1`, `request_gpus = 0`, `request_memory = 4GB`
+- **GPU training**: `request_cpus = 2`, `request_gpus = 1`, `request_memory = 8GB`
+- **Evaluation**: `request_cpus = 1`, `request_gpus = 0`, `request_memory = 2GB`
+
+### Tips
+
+- Use `max_materialize` to limit concurrent jobs and avoid overwhelming the cluster
+- Always test your script locally before submitting to Condor
+- Check `.err` files if jobs fail
+- Use descriptive experiment names to organize results
+- The `experiments/` directory will contain all training outputs
+- Add `.condor_logs/` to `.gitignore` to avoid committing log files
+
