@@ -1,0 +1,14 @@
+universe = vanilla
+executable = ./dummy.sh
+request_cpus = 1
+request_gpus = 0
+request_memory = 2GB
+output = .condor_logs/dummy_$(Process).out
+error  = .condor_logs/dummy_$(Process).err
+log    = .condor_logs/dummy_$(Process).log
++CSCI_GrpDesktop = true
+
+max_materialize = 4
+
+arguments = $(args)
+Queue arguments from dummy_args.txt
