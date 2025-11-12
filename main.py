@@ -1,119 +1,71 @@
 """
-Main CLI for MPN-DQN training, evaluation, and rendering
+Main CLI for MPN-DQN training with TorchRL
 
 Commands:
-    train-neurogym - Train a new MPN-DQN agent on NeuroGym environments
-    resume         - Resume training from checkpoint
+    train-neurogym - Train MPN/RNN agent on NeuroGym environments using TorchRL
     eval           - Evaluate a trained agent
-    render         - Render episode(s) to GIF
-    analyze        - Analyze agent with PCA on hidden states and M matrices
+    render         - Render episode(s) to visualization
 
 Examples:
     # Train on NeuroGym with default settings
-    python main.py train-neurogym
+    python main.py train-neurogym --env-name GoNogo-v0
 
     # Train with custom hyperparameters
     python main.py train-neurogym --experiment-name my-agent --num-episodes 1000 --eta 0.1
 
-    # Resume training
-    python main.py resume --experiment-name my-agent --num-episodes 500
-
     # Evaluate
     python main.py eval --experiment-name my-agent --num-eval-episodes 10
 
-    # Render to GIF
-    python main.py render --experiment-name my-agent --output render.gif
-
-    # Analyze with PCA
-    python main.py analyze --experiment-name my-agent --num-episodes 100 --color-feature 2
+    # Render
+    python main.py render --experiment-name my-agent --output render.png
 """
 
 import argparse
 import sys
-import time
+import math
 import torch
 import numpy as np
-import math
 from pathlib import Path
+import neurogym
+import tqdm
 
-# MPN-DQN imports
-from mpn_dqn import MPNDQN
-from rnn_dqn import RNNDQN
-from model_utils import (ExperimentManager, save_checkpoint, load_checkpoint_for_eval,
-                         load_checkpoint_for_resume, ReplayBuffer, compute_td_loss,
-                         TrialReplayBuffer, compute_td_loss_trial,
-                         SequenceReplayBuffer, compute_td_loss_sequences)
-from visualize import TrainingVisualizer
-from render_utils import render_episode_to_gif
-from neurogym_wrapper import make_neurogym_env
+# TorchRL imports
+from tensordict.nn import TensorDictModule as Mod, TensorDictSequential as Seq
+from torchrl.collectors import SyncDataCollector
+from torchrl.data import LazyMemmapStorage, TensorDictReplayBuffer
+from torchrl.envs import (Compose, ExplorationType, InitTracker,
+                          StepCounter, TransformedEnv, set_exploration_type)
+from torchrl.envs.libs.gym import GymEnv
+from torchrl.modules import MLP, EGreedyModule, QValueModule
+from torchrl.objectives import DQNLoss, SoftUpdate
 
-# Gym import
-import gymnasium as gym
+# Local imports
+from model_utils import ExperimentManager
+from mpn_torchrl_module import MPNModule
+from rnn_module import RNNModule
+from neurogym_transform import NeuroGymInfoTransform
+from neurogym_wrapper import NeuroGymInfoWrapper
+
+# Matplotlib for rendering
+import matplotlib.pyplot as plt
 
 
-def get_epsilon(episode, total_episodes, epsilon_start, epsilon_end, decay_type='linear', decay_param=None):
+def get_epsilon_for_annealing(total_frames, epsilon_start, epsilon_end, annealing_frames=None):
     """
-    Compute epsilon for exploration-exploitation tradeoff.
+    Calculate annealing_num_steps for EGreedyModule.
 
     Args:
-        episode: Current episode number
-        total_episodes: Total number of episodes
-        epsilon_start: Starting epsilon value
-        epsilon_end: Minimum epsilon value
-        decay_type: Type of decay ('linear', 'exponential', 'step')
-        decay_param: Additional parameter for specific decay types
-                     - exponential: decay rate (default: auto-computed to reach epsilon_end in 30% of episodes)
-                     - step: list of (episode_fraction, epsilon_value) tuples
+        total_frames: Total number of training frames
+        epsilon_start: Starting epsilon
+        epsilon_end: Final epsilon
+        annealing_frames: Frames over which to anneal (default: 30% of total)
 
     Returns:
-        epsilon: Current epsilon value
+        annealing_num_steps for EGreedyModule
     """
-    # Fraction of training completed
-    progress = episode / total_episodes
-
-    # Decay schedule reaches epsilon_end at 30% of training
-    decay_fraction = 0.3
-
-    if decay_type == 'linear':
-        # Linear decay from epsilon_start to epsilon_end over decay_fraction of episodes
-        if progress <= decay_fraction:
-            epsilon = epsilon_start - (epsilon_start - epsilon_end) * (progress / decay_fraction)
-        else:
-            epsilon = epsilon_end
-
-    elif decay_type == 'exponential':
-        # Exponential decay: epsilon = epsilon_start * decay_rate^episode
-        # Compute decay_rate to reach epsilon_end at decay_fraction of training
-        if decay_param is None:
-            decay_episodes = int(total_episodes * decay_fraction)
-            decay_param = math.exp(math.log(epsilon_end / epsilon_start) / decay_episodes)
-
-        epsilon = epsilon_start * (decay_param ** episode)
-        epsilon = max(epsilon, epsilon_end)
-
-    elif decay_type == 'step':
-        # Step decay: drop epsilon at specific milestones
-        if decay_param is None:
-            # Default: drop at 10%, 20%, 30% of episodes
-            decay_param = [
-                (0.0, epsilon_start),
-                (0.10, epsilon_start * 0.7),
-                (0.20, epsilon_start * 0.4),
-                (0.30, epsilon_end)
-            ]
-
-        # Find the appropriate epsilon value for current progress
-        epsilon = epsilon_end
-        for i in range(len(decay_param) - 1, -1, -1):
-            threshold, eps_value = decay_param[i]
-            if progress >= threshold:
-                epsilon = eps_value
-                break
-
-    else:
-        raise ValueError(f"Unknown decay_type: {decay_type}. Supported types: 'linear', 'exponential', 'step'")
-
-    return epsilon
+    if annealing_frames is None:
+        annealing_frames = int(total_frames * 0.3)
+    return annealing_frames
 
 
 def get_device(device_str='auto'):
@@ -145,10 +97,168 @@ def get_device(device_str='auto'):
     return device
 
 
+def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, activation, device):
+    """
+    Create policy model with stacked recurrent layers.
+
+    Args:
+        env: Environment (for getting observation/action dimensions)
+        model_type: 'mpn', 'mpn-frozen', or 'rnn'
+        hidden_dim: Hidden layer dimension
+        num_layers: Number of recurrent layers to stack
+        eta: Hebbian learning rate (MPN only)
+        lambda_decay: M matrix decay (MPN only)
+        activation: Activation function
+        device: Device to create model on
+
+    Returns:
+        policy: The policy network (stacked recurrent layers -> mlp -> qval)
+    """
+    # Get environment dimensions
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    action_dim = env.action_spec.space.n
+
+    # Determine model configuration
+    use_rnn = (model_type == 'rnn')
+    freeze_plasticity = (model_type == 'mpn-frozen')
+
+    # Create stacked recurrent layers
+    layers = []
+
+    if use_rnn:
+        # RNN supports multiple layers natively
+        recurrent_module = RNNModule(
+            input_size=obs_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            nonlinearity=activation,
+            device=device,
+            in_key="observation",
+            out_key=f"embed_{num_layers-1}",
+        )
+        layers.append(recurrent_module)
+        env.append_transform(recurrent_module.make_tensordict_primer())
+    else:
+        # Stack multiple MPN layers
+        for layer_idx in range(num_layers):
+            in_key = "observation" if layer_idx == 0 else f"embed_{layer_idx-1}"
+            out_key = f"embed_{layer_idx}"
+
+            # Recurrent state keys for this layer
+            in_keys = [in_key, f"recurrent_state_{layer_idx}"]
+            out_keys = [out_key, ("next", f"recurrent_state_{layer_idx}")]
+
+            mpn_layer = MPNModule(
+                input_size=obs_dim if layer_idx == 0 else hidden_dim,
+                hidden_size=hidden_dim,
+                eta=eta,
+                lambda_decay=lambda_decay,
+                activation=activation,
+                freeze_plasticity=freeze_plasticity,
+                device=device,
+                in_keys=in_keys,
+                out_keys=out_keys,
+            )
+            layers.append(mpn_layer)
+            env.append_transform(mpn_layer.make_tensordict_primer())
+
+    # Combine layers into sequence
+    recurrent_module = Seq(*layers)
+
+    # Create MLP head for Q-values (reads from final layer output)
+    mlp = MLP(
+        out_features=action_dim,
+        num_cells=[hidden_dim],
+        device=device,
+    )
+    mlp[-1].bias.data.fill_(0.0)
+    mlp_module = Mod(mlp, in_keys=[f"embed_{num_layers-1}"], out_keys=["action_value"])
+
+    # Q-value module
+    qval = QValueModule(spec=env.action_spec)
+
+    # Build policy
+    policy = Seq(recurrent_module, mlp_module, qval)
+
+    return policy
+
+
+def evaluate_policy(policy, env, num_steps, device):
+    """
+    Evaluate policy on GoNogo task by doing a rollout for a fixed number of steps.
+
+    Uses ground truth ('gt') and trial completion ('new_trial') to properly count:
+    - True Positives (TP): Correct Go responses (reward = +1.0, gt = 1)
+    - False Negatives (FN): Missed Go trials (no response when gt = 1)
+    - True Negatives (TN): Correct No-go (no response when gt = 0)
+    - False Positives (FP): Incorrect No-go responses (reward = -0.5, gt = 0)
+
+    Returns:
+        accuracy: (TP + TN) / total_trials
+        true_positives: Number of correct Go responses (TP)
+        true_negatives: Number of correct No-go rejections (TN)
+        false_negatives: Number of missed Go trials (FN)
+        false_positives: Number of incorrect No-go responses (FP)
+        total_reward: Total cumulative reward
+        total_trials: Total number of completed trials
+    """
+    policy.eval()
+
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        # Do a full rollout
+        rollout = env.rollout(num_steps, policy)
+
+        # Extract data from rollout as numpy arrays
+        rewards = rollout.get(("next", "reward"))
+        rewards = rewards.cpu().numpy() if torch.is_tensor(rewards) else np.array(rewards)
+        rewards = rewards.squeeze()  # Remove extra dimensions
+
+        # Get ground truth and new_trial flags (both in "next" dict)
+        gt = rollout.get(("next", "gt"))
+        gt = gt.cpu().numpy() if torch.is_tensor(gt) else np.array(gt)
+
+        new_trial = rollout.get(("next", "new_trial"))
+        new_trial = new_trial.cpu().numpy() if torch.is_tensor(new_trial) else np.array(new_trial)
+
+        # Count trial outcomes at trial completion points
+        # Exclude abort trials (reward = -0.1) from analysis
+        trial_complete_mask = new_trial.astype(bool)
+        abort_mask = (rewards > -0.2) & (rewards < -0.05)  # reward ~ -0.1
+        valid_trial_mask = trial_complete_mask & ~abort_mask
+
+        # Go trials (gt == 1) and No-go trials (gt == 0)
+        go_trial_mask = (gt == 1) & valid_trial_mask
+        nogo_trial_mask = (gt == 0) & valid_trial_mask
+
+        # True Positives: correct Go responses (reward > 0 at Go trial completion)
+        true_positives = ((rewards > 0.5) & go_trial_mask).sum()
+
+        # False Negatives: failed to respond on Go trials (reward == 0 at Go trial completion)
+        false_negatives = ((rewards == 0) & go_trial_mask).sum()
+
+        # True Negatives: correctly withheld on No-go trials (reward == 0 at No-go completion)
+        true_negatives = ((rewards == 0) & nogo_trial_mask).sum()
+
+        # False Positives: incorrectly responded on No-go trials (reward < 0, excluding aborts)
+        false_positives = ((rewards < -0.4) & nogo_trial_mask).sum()
+
+        # Total trials (excluding aborts)
+        total_trials = valid_trial_mask.sum()
+
+        # Calculate accuracy
+        accuracy = (true_positives + true_negatives) / total_trials if total_trials > 0 else 0.0
+
+        # Total reward
+        total_reward = rewards.sum()
+
+    policy.train()
+    return accuracy, int(true_positives), int(true_negatives), int(false_negatives), int(false_positives), float(total_reward), int(total_trials)
+
+
 def train_neurogym(args):
-    """Train MPN-DQN on NeuroGym environment with sequence replay."""
+    """Train MPN/RNN-DQN on NeuroGym environment using TorchRL."""
     print("="*60)
-    print("Training MPN-DQN on NeuroGym (Sequence Replay)")
+    print("Training with TorchRL on NeuroGym")
     print("="*60)
 
     # Create experiment manager
@@ -158,314 +268,306 @@ def train_neurogym(args):
 
     # Save configuration
     config = vars(args)
+    config['command'] = 'train-neurogym'
     exp_manager.save_config(config)
 
-    # Setup device (GPU/CPU)
+    # Setup device
     device = get_device(args.device)
     print()
 
-    # Create NeuroGym environment
+    # Create NeuroGym environment using TorchRL's GymEnv
     print(f"Creating NeuroGym environment: {args.env_name}")
-    max_episode_steps = getattr(args, 'max_episode_steps', 500)
-    env = make_neurogym_env(args.env_name, max_episode_steps=max_episode_steps)
-    print(f"Max episode steps: {max_episode_steps}")
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
 
-    # Determine model configuration based on model_type
-    model_type = args.model_type
-    freeze_plasticity = (model_type == 'mpn-frozen')
-    use_rnn = (model_type == 'rnn')
+    # Create GymEnv first with the env name
+    gymenv = GymEnv(args.env_name, device=device)
 
-    print(f"Algorithm: DQN (Deep Q-Network) with Sequence Replay")
-    print(f"Model type: {model_type.upper()}")
+    # Then wrap the internal gym environment to capture info dict
+    gymenv._env = NeuroGymInfoWrapper(gymenv._env)
+
+    env = TransformedEnv(
+        gymenv,
+        Compose(
+            StepCounter(max_steps=args.max_episode_steps),
+            InitTracker(),
+            NeuroGymInfoTransform(),  # Extract gt and new_trial from info
+        )
+    )
+
+    # Get environment dimensions
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    action_dim = env.action_spec.space.n
+
+    # Print model configuration
+    use_rnn = (args.model_type == 'rnn')
+    freeze_plasticity = (args.model_type == 'mpn-frozen')
+
+    print(f"Algorithm: DQN with TorchRL")
+    print(f"Model type: {args.model_type.upper()}")
     print(f"Environment: {args.env_name}")
     print(f"Observation dim: {obs_dim}, Action dim: {action_dim}")
+    print(f"Max episode steps: {args.max_episode_steps}")
 
     if use_rnn:
-        print(f"RNN: hidden_dim={args.hidden_dim}, activation={args.activation}\n")
+        print(f"RNN: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}, activation={args.activation}\n")
     else:
-        print(f"MPN: hidden_dim={args.hidden_dim}, eta={args.eta}, lambda={args.lambda_decay}")
-        print(f"Plasticity frozen: {freeze_plasticity}\n")
+        print(f"MPN: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}, eta={args.eta}, lambda={args.lambda_decay}")
+        print(f"Activation: {args.activation}, Plasticity frozen: {freeze_plasticity}\n")
 
-    # Create networks based on model type
-    if use_rnn:
-        # Use vanilla RNN
-        online_dqn = RNNDQN(
-            obs_dim=obs_dim,
-            hidden_dim=args.hidden_dim,
-            action_dim=action_dim,
-            activation=args.activation,
-        ).to(device)
+    # Create policy model
+    policy = create_model(
+        env=env,
+        model_type=args.model_type,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        eta=args.eta,
+        lambda_decay=args.lambda_decay,
+        activation=args.activation,
+        device=device
+    )
 
-        target_dqn = RNNDQN(
-            obs_dim=obs_dim,
-            hidden_dim=args.hidden_dim,
-            action_dim=action_dim,
-            activation=args.activation,
-        ).to(device)
-    else:
-        # Use MPN (with or without plasticity)
-        online_dqn = MPNDQN(
-            obs_dim=obs_dim,
-            hidden_dim=args.hidden_dim,
-            action_dim=action_dim,
-            eta=args.eta,
-            lambda_decay=args.lambda_decay,
-            activation=args.activation,
-            freeze_plasticity=freeze_plasticity
-        ).to(device)
+    # Exploration module
+    total_frames = args.total_frames
+    annealing_frames = get_epsilon_for_annealing(
+        total_frames, args.epsilon_start, args.epsilon_end
+    )
 
-        target_dqn = MPNDQN(
-            obs_dim=obs_dim,
-            hidden_dim=args.hidden_dim,
-            action_dim=action_dim,
-            eta=args.eta,
-            lambda_decay=args.lambda_decay,
-            activation=args.activation,
-            freeze_plasticity=freeze_plasticity
-        ).to(device)
+    exploration_module = EGreedyModule(
+        annealing_num_steps=annealing_frames,
+        spec=env.action_spec,
+        eps_init=args.epsilon_start,
+        eps_end=args.epsilon_end,
+        device=device
+    )
 
-    target_dqn.load_state_dict(online_dqn.state_dict())
+    stoch_policy = Seq(policy, exploration_module)
+
+    # Test policy
+    print("Testing policy forward pass...")
+    test_td = env.reset()
+    test_td = stoch_policy(test_td)
+    print(f"Policy output keys: {list(test_td.keys())}\n")
+
+    # Create DQN loss
+    loss_fn = DQNLoss(policy, action_space=env.action_spec, delay_value=True)
+
+    # Target network updater
+    updater = SoftUpdate(loss_fn, eps=args.target_update_tau)
 
     # Optimizer
-    optimizer = torch.optim.Adam(online_dqn.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
 
-    # Sequence replay buffer
-    replay_buffer = SequenceReplayBuffer(
-        capacity=args.buffer_size * 100,
-        sequence_length=args.sequence_length
+    # Data collector
+    collector = SyncDataCollector(
+        env,
+        stoch_policy,
+        frames_per_batch=args.frames_per_batch,
+        total_frames=total_frames,
+        device=device,
     )
-    batch_size = args.sequence_batch_size
-    print(f"SequenceReplayBuffer: L={args.sequence_length}, batch={batch_size}, capacity={args.buffer_size * 100}")
 
-    # Visualization
-    viz = TrainingVisualizer()
+    # Replay buffer
+    replay_buffer = TensorDictReplayBuffer(
+        storage=LazyMemmapStorage(args.buffer_size),
+        batch_size=args.batch_size,
+        prefetch=10,
+    )
 
-    # Training loop
-    best_avg_reward = -float('inf')
-    total_training_steps = 0  # Track training steps for target network updates
-    total_env_steps = 0  # Track total environment steps
-    train_freq = getattr(args, 'train_freq', 1)
-
-    print(f"Epsilon decay: {args.epsilon_decay_type} (ε: {args.epsilon_start} → {args.epsilon_end} in 30% of episodes)")
+    print(f"Replay buffer: capacity={args.buffer_size}, batch_size={args.batch_size}")
+    print(f"UTD (updates-to-data): {args.utd}")
+    print(f"Epsilon: {args.epsilon_start} → {args.epsilon_end} over {annealing_frames} frames")
+    print(f"Target update tau: {args.target_update_tau}")
+    print(f"Total frames: {total_frames}")
     print("Starting training...")
     print("-"*60)
 
-    for episode in range(args.num_episodes):
-        # Compute epsilon for this episode using selected decay schedule
-        epsilon = get_epsilon(
-            episode=episode,
-            total_episodes=args.num_episodes,
-            epsilon_start=args.epsilon_start,
-            epsilon_end=args.epsilon_end,
-            decay_type=args.epsilon_decay_type,
-            decay_param=getattr(args, 'epsilon_decay_param', None)
+    # Training metrics
+    batch_rewards = []
+    batch_losses = []
+    best_accuracy = -float('inf')
+    frames_collected = 0
+
+    # Evaluation metrics tracking
+    eval_accuracies = []
+    eval_true_positives = []
+    eval_true_negatives = []
+    eval_false_negatives = []
+    eval_false_positives = []
+    eval_total_trials = []
+
+    # Progress bar
+    pbar = tqdm.tqdm(total=total_frames, desc="Training", unit="frames")
+
+    # Training loop
+    for i, data in enumerate(collector):
+        # Add data to replay buffer
+        replay_buffer.extend(data.unsqueeze(0).to_tensordict().cpu())
+
+        frames_collected += data.numel()
+
+        # Perform multiple gradient updates (UTD)
+        batch_loss_vals = []
+        for _ in range(args.utd):
+            if len(replay_buffer) >= args.batch_size:
+                sample = replay_buffer.sample().to(device, non_blocking=True)
+                loss_vals = loss_fn(sample)
+
+                optimizer.zero_grad()
+                loss_vals["loss"].backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), args.grad_clip)
+                optimizer.step()
+
+                batch_loss_vals.append(loss_vals["loss"].item())
+
+                # Update target network
+                updater.step()
+
+        # Update exploration
+        exploration_module.step(data.numel())
+
+        # Track metrics per batch
+        batch_reward = data["next", "reward"].sum().item()
+        batch_loss = np.mean(batch_loss_vals) if batch_loss_vals else 0.0
+        # Convert epsilon to Python float (may be tensor)
+        current_epsilon = float(exploration_module.eps.item()) if torch.is_tensor(exploration_module.eps) else float(exploration_module.eps)
+
+        # Store metrics
+        batch_rewards.append(batch_reward)
+        if batch_loss_vals:
+            batch_losses.append(batch_loss)
+
+        # Update progress bar
+        pbar.update(data.numel())
+        pbar.set_postfix({
+            'reward': f'{batch_reward:.2f}',
+            'loss': f'{batch_loss:.4f}',
+            'eps': f'{current_epsilon:.3f}',
+            'buffer': len(replay_buffer)
+        })
+
+        # Save to history every batch
+        exp_manager.append_training_history(
+            int(frames_collected),
+            float(batch_reward),
+            int(data.numel()),
+            float(batch_loss),
+            float(current_epsilon)
         )
 
-        # Reset environment and state
-        obs, info = env.reset()
-        obs = torch.FloatTensor(obs).to(device)
-        # Initialize MPN state ONCE per episode (persists across trials)
-        episode_state = online_dqn.init_state(batch_size=1, device=device)
+        # Print progress and evaluate every N frames
+        if frames_collected % args.print_freq == 0 and frames_collected > 0:
+            # Run evaluation rollout (using max_episode_steps)
+            eval_accuracy, eval_tp, eval_tn, eval_fn, eval_fp, eval_total_reward, eval_trials = evaluate_policy(
+                policy, env, args.max_episode_steps, device
+            )
 
-        episode_reward = 0
-        episode_length = 0
-        episode_losses = []
-        num_trials_detected = 0  # Track trial boundaries
+            # Store evaluation metrics
+            eval_accuracies.append(eval_accuracy)
+            eval_true_positives.append(eval_tp)
+            eval_true_negatives.append(eval_tn)
+            eval_false_negatives.append(eval_fn)
+            eval_false_positives.append(eval_fp)
+            eval_total_trials.append(eval_trials)
 
-        # Safety counter to prevent infinite loops
-        max_trial_steps = 1000  # Safety limit
-        trial_step_counter = 0
+            # Calculate recent batch averages for comparison
+            recent_window = min(100, len(batch_rewards))
+            avg_batch_reward = np.mean(batch_rewards[-recent_window:]) if batch_rewards else 0.0
+            avg_loss = np.mean(batch_losses[-recent_window:]) if batch_losses else 0.0
 
-        # Episode loop (processes multiple trials)
-        while True:
-            # Select action
-            with torch.no_grad():
-                q_values, next_state = online_dqn(obs.unsqueeze(0), episode_state)
+            # Print combined progress and evaluation
+            tqdm.tqdm.write(f"Frames {frames_collected:7d}/{total_frames} | "
+                            f"Accuracy: {eval_accuracy:7.4f} | "
+                            f"Total Reward: {eval_total_reward:7.2f} | "
+                            f"Trials: {eval_trials:3d} | "
+                            f"TP: {eval_tp:3d} | "
+                            f"TN: {eval_tn:3d} | "
+                            f"FN: {eval_fn:3d} | "
+                            f"FP: {eval_fp:3d} | "
+                            f"Loss: {avg_loss:6.4f} | "
+                            f"ε: {current_epsilon:.3f}")
 
-                if np.random.random() < epsilon:
-                    action = env.action_space.sample()
-                else:
-                    action = q_values.argmax(dim=1).item()
+            # Check if this is the best eval performance
+            if eval_accuracy > best_accuracy:
+                best_accuracy = eval_accuracy
 
-            # Take step
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            next_obs = torch.FloatTensor(next_obs).to(device)
+                # Save as best model
+                exp_manager.save_model(
+                    policy,
+                    optimizer=optimizer,
+                    checkpoint_name="best_model.pt",
+                    metadata={
+                        'frames': int(frames_collected),
+                        'eval_accuracy': float(eval_accuracy),
+                        'eval_total_reward': float(eval_total_reward),
+                        'eval_trials': int(eval_trials),
+                        'eval_true_positives': int(eval_tp),
+                        'eval_true_negatives': int(eval_tn),
+                        'eval_false_negatives': int(eval_fn),
+                        'eval_false_positives': int(eval_fp),
+                        'epsilon': float(current_epsilon),
+                    }
+                )
+                tqdm.tqdm.write(f"  → New best model! Accuracy: {eval_accuracy:.4f}")
 
-            # Store transition with episode ID for sequence replay
-            replay_buffer.push(obs, action, reward, next_obs, done, episode)
+        # Checkpoint every N frames
+        if frames_collected % args.checkpoint_freq == 0 and frames_collected > 0:
+            # Save periodic checkpoint
+            exp_manager.save_model(
+                policy,
+                optimizer=optimizer,
+                checkpoint_name=f"checkpoint_{frames_collected}.pt",
+                metadata={
+                    'frames': int(frames_collected),
+                    'epsilon': float(current_epsilon),
+                }
+            )
+            tqdm.tqdm.write(f"  → Checkpoint saved at {frames_collected} frames")
 
-            # Update observation and state (STATE PERSISTS ACROSS TRIALS!)
-            obs = next_obs
-            episode_state = next_state
-            episode_reward += reward
-            episode_length += 1
-            trial_step_counter += 1
-            total_env_steps += 1
-
-            # Safety check: force episode end if trial is taking too long
-            if trial_step_counter >= max_trial_steps:
-                print(f"\n⚠️  Warning: Trial exceeded {max_trial_steps} steps, forcing episode end (episode {episode})")
-                done = True
-                break
-
-            # Check for trial boundary (reset counter but don't reset state)
-            if info.get('new_trial', False):
-                num_trials_detected += 1
-                trial_step_counter = 0
-
-            # Train on batches (only every train_freq steps for efficiency)
-            if len(replay_buffer) >= batch_size and total_env_steps % train_freq == 0:
-                # Sample fixed-length sequences
-                sequences = replay_buffer.sample(batch_size)
-                if sequences:  # Check if we got sequences
-                    loss = compute_td_loss_sequences(
-                        online_dqn, target_dqn, sequences,
-                        args.gamma, device=device
-                    )
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(online_dqn.parameters(), args.grad_clip)
-                    optimizer.step()
-
-                    episode_losses.append(loss.item())
-                    total_training_steps += 1
-
-                    # Update target network by training steps (not episodes)
-                    if total_training_steps % args.target_update_freq == 0:
-                        target_dqn.load_state_dict(online_dqn.state_dict())
-
-            if done:
-                # Episode ended
-                break
-
-        # Epsilon is computed at the start of each episode using the decay schedule
-        # (no manual decay needed here)
-
-        # Track metrics
-        avg_loss = np.mean(episode_losses) if episode_losses else 0.0
-        exp_manager.append_training_history(episode, episode_reward, episode_length, avg_loss, epsilon, num_trials_detected)
-
-        # Update visualization
-        if viz is not None:
-            viz.update(episode=episode, episode_reward=episode_reward,
-                      episode_length=episode_length, loss=avg_loss, epsilon=epsilon)
-
-        # Checkpoint
-        if episode % args.checkpoint_freq == 0 and episode > 0:
-            # Calculate average reward over last window
-            history = exp_manager.load_training_history()
-            recent_rewards = history['rewards'][-args.checkpoint_freq:]
-            avg_reward = np.mean(recent_rewards)
-
-            is_best = avg_reward > best_avg_reward
-            if is_best:
-                best_avg_reward = avg_reward
-
-            save_checkpoint(exp_manager, online_dqn, optimizer, episode, avg_reward, is_best=is_best)
-
-        # Print progress
-        if episode % args.print_freq == 0:
-            history = exp_manager.load_training_history()
-            recent_rewards = history['rewards'][-args.print_freq:]
-            avg_reward = np.mean(recent_rewards)
-            print(f"Ep {episode:5d}/{args.num_episodes} | "
-                  f"Reward: {avg_reward:7.2f} | "
-                  f"Len: {episode_length:4d} | "
-                  f"Trials: {num_trials_detected:3d} | "
-                  f"Loss: {avg_loss:6.4f} | "
-                  f"ε: {epsilon:.3f} | "
-                  f"Steps: {total_training_steps:6d} | "
-                  f"Buffer: {len(replay_buffer):6d}")
+    # Close progress bar
+    pbar.close()
 
     # Save final model
-    history = exp_manager.load_training_history()
-    final_avg_reward = np.mean(history['rewards'][-10:])
-    save_checkpoint(exp_manager, online_dqn, optimizer, args.num_episodes,
-                   final_avg_reward, is_best=False, is_final=True)
+    final_avg_reward = float(np.mean(batch_rewards[-100:])) if len(batch_rewards) >= 100 else 0.0
+    exp_manager.save_model(
+        policy,
+        optimizer=optimizer,
+        checkpoint_name="final_model.pt",
+        metadata={
+            'frames': int(frames_collected),
+            'avg_reward': float(final_avg_reward),
+        }
+    )
 
-    # Plot training curves
-    if viz is not None:
-        plot_path = exp_manager.plot_dir / "training_curves.png"
-        viz.plot(save_path=str(plot_path))
+    # Save training metrics for plotting
+    import json
+    metrics_path = exp_manager.exp_dir / "training_metrics.json"
+    metrics = {
+        'eval_accuracies': eval_accuracies,
+        'eval_true_positives': eval_true_positives,
+        'eval_true_negatives': eval_true_negatives,
+        'eval_false_negatives': eval_false_negatives,
+        'eval_false_positives': eval_false_positives,
+        'eval_total_trials': eval_total_trials,
+        'batch_rewards': batch_rewards,
+        'batch_losses': batch_losses,
+    }
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Saved training metrics to {metrics_path}")
 
     env.close()
     print("\n" + "="*60)
     print("Training completed!")
-    print(f"Final avg reward: {final_avg_reward:.2f}")
-    print(f"Best avg reward: {best_avg_reward:.2f}")
+    print(f"Total frames: {frames_collected}")
+    if eval_accuracies:
+        print(f"Best eval accuracy: {best_accuracy:.4f}")
+        print(f"Final eval accuracy: {eval_accuracies[-1]:.4f}")
+        print(f"Final eval trials: {eval_total_trials[-1]}")
+        print(f"Final eval false negatives: {eval_false_negatives[-1]}")
+        print(f"Final eval false positives: {eval_false_positives[-1]}")
+    else:
+        print(f"Final batch avg reward: {final_avg_reward:.2f}")
     print(f"Results saved to: {exp_manager.exp_dir}")
     print("="*60)
-
-
-def resume_training(args):
-    """Resume training from checkpoint."""
-    print("="*60)
-    print("Resuming MPN-DQN Training")
-    print("="*60)
-
-    # Load experiment
-    exp_manager = ExperimentManager(args.experiment_name)
-    if not exp_manager.config_path.exists():
-        print(f"Error: Experiment '{args.experiment_name}' not found!")
-        sys.exit(1)
-
-    # Load config
-    config = exp_manager.load_config()
-    print(f"Loaded experiment: {exp_manager.experiment_name}")
-    print(f"Original config: {config}\n")
-
-    # Use max_episode_steps from args if provided, otherwise from config
-    max_episode_steps = args.max_episode_steps if args.max_episode_steps is not None else config.get('max_episode_steps', 2000)
-
-    # Create environment
-    env = gym.make(config['env_name'],
-                   render_mode=None,
-                   max_episode_steps=max_episode_steps)
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-
-    # Create networks
-    online_dqn = MPNDQN(
-        obs_dim=obs_dim,
-        hidden_dim=config['hidden_dim'],
-        action_dim=action_dim,
-        eta=config['eta'],
-        lambda_decay=config['lambda_decay'],
-        activation=config.get('activation', 'tanh')
-    )
-
-    target_dqn = MPNDQN(
-        obs_dim=obs_dim,
-        hidden_dim=config['hidden_dim'],
-        action_dim=action_dim,
-        eta=config['eta'],
-        lambda_decay=config['lambda_decay'],
-        activation=config.get('activation', 'tanh')
-    )
-
-    # Optimizer
-    optimizer = torch.optim.Adam(online_dqn.parameters(), lr=config['learning_rate'])
-
-    # Load checkpoint
-    metadata = load_checkpoint_for_resume(exp_manager, online_dqn, optimizer)
-    start_episode = metadata.get('episode', 0) + 1
-    target_dqn.load_state_dict(online_dqn.state_dict())
-
-    print(f"Resuming from episode {start_episode}")
-    print(f"Training for {args.num_episodes} more episodes\n")
-
-    # Continue training (similar to train() but with offset episode numbers)
-    # [Training loop similar to train() but starting from start_episode]
-    # For brevity, using simplified version - you can expand this
-
-    print("Resume training completed!")
-    print(f"Results appended to: {exp_manager.exp_dir}")
-
-    env.close()
 
 
 def evaluate(args):
@@ -478,56 +580,43 @@ def evaluate(args):
     exp_manager = ExperimentManager(args.experiment_name)
     config = exp_manager.load_config()
 
-    # Detect model type from config
-    model_type = config.get('model_type', 'mpn')  # Default to 'mpn' for backward compatibility
+    # Detect model type
+    model_type = config.get('model_type', 'mpn')
     use_rnn = (model_type == 'rnn')
     freeze_plasticity = (model_type == 'mpn-frozen')
 
     print(f"Model type: {model_type.upper()}")
 
-    # Create environment (handle both Gym and NeuroGym)
-    env_name = config['env_name']
-    is_neurogym = (config.get('command') == 'train-neurogym')
-    render_mode = 'rgb_array' if args.render else None
-
-    if is_neurogym:
-        env = make_neurogym_env(env_name, max_episode_steps=args.max_episode_steps)
-    else:
-        env = gym.make(env_name, render_mode=render_mode,
-                       max_episode_steps=args.max_episode_steps)
-
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-
     # Setup device
     device = get_device(args.device)
     print()
 
-    # Create model based on type
-    if use_rnn:
-        dqn = RNNDQN(
-            obs_dim=obs_dim,
-            hidden_dim=config['hidden_dim'],
-            action_dim=action_dim,
-            activation=config.get('activation', 'tanh')
-        ).to(device)
-    else:
-        dqn = MPNDQN(
-            obs_dim=obs_dim,
-            hidden_dim=config['hidden_dim'],
-            action_dim=action_dim,
-            eta=config.get('eta', 0.1),
-            lambda_decay=config.get('lambda_decay', 0.95),
-            activation=config.get('activation', 'tanh'),
-            freeze_plasticity=freeze_plasticity
-        ).to(device)
+    # Create environment
+    env = TransformedEnv(
+        GymEnv(config['env_name'], device=device),
+        Compose(
+            StepCounter(max_steps=args.max_episode_steps),
+            InitTracker(),
+        )
+    )
+
+    # Create policy model
+    policy = create_model(
+        env=env,
+        model_type=config.get('model_type', 'mpn'),
+        hidden_dim=config['hidden_dim'],
+        num_layers=config.get('num_layers', 1),
+        eta=config.get('eta', 0.1),
+        lambda_decay=config.get('lambda_decay', 0.95),
+        activation=config.get('activation', 'tanh'),
+        device=device
+    )
 
     # Load checkpoint
     checkpoint_name = args.checkpoint if args.checkpoint else "best_model.pt"
-    load_checkpoint_for_eval(exp_manager, dqn, checkpoint_name, device=str(device))
+    exp_manager.load_model(policy, checkpoint_name=checkpoint_name, device=str(device))
 
-    # Set to eval mode
-    dqn.eval()
+    policy.eval()
 
     print(f"Loaded checkpoint: {checkpoint_name}")
     print(f"Max episode steps: {args.max_episode_steps}")
@@ -535,598 +624,222 @@ def evaluate(args):
 
     # Evaluate
     rewards = []
-    for ep in range(args.num_eval_episodes):
-        obs, _ = env.reset() if isinstance(env.reset(), tuple) else (env.reset(), {})
-        obs = torch.FloatTensor(obs).to(device)
-        state = dqn.init_state(batch_size=1, device=device)
+    lengths = []
 
-        episode_reward = 0
-        episode_length = 0
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        for ep in tqdm.tqdm(range(args.num_eval_episodes), desc="Evaluating", unit="episode"):
+            td = env.reset()
+            episode_reward = 0
+            episode_length = 0
 
-        while True:
-            with torch.no_grad():
-                q_values, state = dqn(obs.unsqueeze(0), state)
-                action = q_values.argmax(dim=1).item()
+            while episode_length < args.max_episode_steps:
+                td = policy(td)
 
-            obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            obs = torch.FloatTensor(obs).to(device)
-            episode_reward += reward
-            episode_length += 1
+                # Check for termination
+                if td.get("done", torch.tensor(False)).item():
+                    break
 
-            if done:
-                break
+                # Get reward
+                episode_reward += td.get(("next", "reward"), torch.tensor(0.0)).item()
+                episode_length += 1
 
-        rewards.append(episode_reward)
-        print(f"Episode {ep+1}/{args.num_eval_episodes}: Reward = {episode_reward:.2f}, Length = {episode_length}")
+                # Move to next step
+                td = env.step(td)
+
+            rewards.append(episode_reward)
+            lengths.append(episode_length)
+            tqdm.tqdm.write(f"Episode {ep+1}/{args.num_eval_episodes}: Reward = {episode_reward:.2f}, Length = {episode_length}")
 
     env.close()
 
     print("\n" + "="*60)
     print("Evaluation Results:")
     print(f"  Mean reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
+    print(f"  Mean length: {np.mean(lengths):.2f} ± {np.std(lengths):.2f}")
     print(f"  Min reward:  {np.min(rewards):.2f}")
     print(f"  Max reward:  {np.max(rewards):.2f}")
     print("="*60)
 
 
-def render_to_gif(args):
-    """Render episode to GIF."""
+def render_to_plot(args):
+    """Render episode to static plot (for NeuroGym environments)."""
     print("="*60)
-    print("Rendering Agent to GIF")
+    print("Rendering Agent Episode")
     print("="*60)
 
     # Load experiment
     exp_manager = ExperimentManager(args.experiment_name)
     config = exp_manager.load_config()
 
-    # Detect model type from config
-    model_type = config.get('model_type', 'mpn')  # Default to 'mpn' for backward compatibility
+    # Detect model type
+    model_type = config.get('model_type', 'mpn')
     use_rnn = (model_type == 'rnn')
     freeze_plasticity = (model_type == 'mpn-frozen')
 
     print(f"Model type: {model_type.upper()}")
 
-    # Determine output path (default to videos directory if not specified)
-    if args.output is None:
-        output_path = exp_manager.video_dir / "render.gif"
-    else:
-        output_path = args.output
-
-    # Create environment (handle both Gym and NeuroGym)
-    env_name = config['env_name']
-    is_neurogym = (config.get('command') == 'train-neurogym')
-
-    if is_neurogym:
-        env = make_neurogym_env(env_name, max_episode_steps=args.max_episode_steps)
-    else:
-        env = gym.make(env_name, render_mode='rgb_array',
-                       max_episode_steps=args.max_episode_steps)
-
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-
-    # Setup device (CPU for rendering to avoid GPU overhead)
+    # Setup device (CPU for rendering)
     device = torch.device('cpu')
-    print("Using CPU for rendering")
-    print()
-
-    # Create model based on type
-    if use_rnn:
-        dqn = RNNDQN(
-            obs_dim=obs_dim,
-            hidden_dim=config['hidden_dim'],
-            action_dim=action_dim,
-            activation=config.get('activation', 'tanh')
-        ).to(device)
-    else:
-        dqn = MPNDQN(
-            obs_dim=obs_dim,
-            hidden_dim=config['hidden_dim'],
-            action_dim=action_dim,
-            eta=config.get('eta', 0.1),
-            lambda_decay=config.get('lambda_decay', 0.95),
-            activation=config.get('activation', 'tanh'),
-            freeze_plasticity=freeze_plasticity
-        ).to(device)
-
-    # Load checkpoint
-    checkpoint_name = args.checkpoint if args.checkpoint else "best_model.pt"
-    load_checkpoint_for_eval(exp_manager, dqn, checkpoint_name, device='cpu')
-
-    # Set to eval mode
-    dqn.eval()
-
-    print(f"Loaded checkpoint: {checkpoint_name}")
-    print(f"Max episode steps: {args.max_episode_steps}")
-    print(f"Rendering to: {output_path}\n")
-
-    # Render - use different function for NeuroGym
-    if is_neurogym:
-        from render_utils import render_neurogym_episode
-        # Change output extension to .png for NeuroGym static plots
-        if str(output_path).endswith('.gif'):
-            output_path = str(output_path).replace('.gif', '.png')
-        reward, episode_data = render_neurogym_episode(
-            dqn, env, str(output_path),
-            max_steps=args.max_episode_steps,
-            seed=args.seed
-        )
-    else:
-        reward = render_episode_to_gif(
-            dqn, env, str(output_path),
-            max_steps=args.max_episode_steps,
-            fps=args.fps
-        )
-
-    env.close()
-
-    print(f"\nRendering completed! Episode reward: {reward:.2f}")
-    if is_neurogym:
-        print(f"Plot saved to: {output_path}")
-    else:
-        print(f"GIF saved to: {output_path}")
-
-
-def analyze_collect(args):
-    """Collect episode data and save to npz."""
-    print("="*60)
-    print("Collecting MPN-DQN Episode Data")
-    print("="*60)
-
-    # Load experiment
-    exp_manager = ExperimentManager(args.experiment_name)
-    config = exp_manager.load_config()
-
-    # Create analysis output directory
-    analysis_dir = exp_manager.exp_dir / "analysis"
-    analysis_dir.mkdir(exist_ok=True)
+    print("Using CPU for rendering\n")
 
     # Create environment
-    env = gym.make(config['env_name'], render_mode='rgb_array',
-                   max_episode_steps=args.max_episode_steps)
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+    env = TransformedEnv(
+        GymEnv(config['env_name'], device=device),
+        Compose(
+            StepCounter(max_steps=args.max_episode_steps),
+            InitTracker(),
+        )
+    )
 
-    # Setup device
-    device = get_device(args.device)
-    print()
-
-    # Create model
-    dqn = MPNDQN(
-        obs_dim=obs_dim,
+    # Create policy model
+    policy = create_model(
+        env=env,
+        model_type=config.get('model_type', 'mpn'),
         hidden_dim=config['hidden_dim'],
-        action_dim=action_dim,
-        eta=config['eta'],
-        lambda_decay=config['lambda_decay'],
-        activation=config.get('activation', 'tanh')
-    ).to(device)
+        num_layers=config.get('num_layers', 1),
+        eta=config.get('eta', 0.1),
+        lambda_decay=config.get('lambda_decay', 0.95),
+        activation=config.get('activation', 'tanh'),
+        device=device
+    )
 
     # Load checkpoint
     checkpoint_name = args.checkpoint if args.checkpoint else "best_model.pt"
-    load_checkpoint_for_eval(exp_manager, dqn, checkpoint_name, device=str(device))
+    exp_manager.load_model(policy, checkpoint_name=checkpoint_name, device='cpu')
 
-    # Set to eval mode
-    dqn.eval()
+    policy.eval()
 
     print(f"Loaded checkpoint: {checkpoint_name}")
-    print(f"Environment: {config['env_name']}")
-    print(f"Max episode steps: {args.max_episode_steps}")
-    print(f"Collecting {args.num_episodes} episodes\n")
+    print(f"Max episode steps: {args.max_episode_steps}\n")
 
-    # Import PCA analysis tools
-    from pca_analysis import collect_episodes, save_collected_data
+    # Determine output path
+    if args.output is None:
+        output_path = exp_manager.plot_dir / "episode_render.png"
+    else:
+        output_path = Path(args.output)
 
-    # Collect episodes
-    print("Collecting episodes...")
-    collector = collect_episodes(dqn, env, args.num_episodes, device,
-                                 epsilon=0.0, max_steps=args.max_episode_steps)
+    # Rollout episode
+    print("Running episode...")
+    observations = []
+    actions = []
+    rewards = []
 
-    data = collector.get_data()
-    print(f"\nCollected {len(data['hidden'])} episodes")
-    print(f"Episode lengths - Mean: {np.mean(data['lengths']):.1f}, "
-          f"Min: {np.min(data['lengths'])}, Max: {np.max(data['lengths'])}\n")
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        td = env.reset()
 
-    # Save to npz
-    save_path = analysis_dir / "pca_data.npz"
-    save_collected_data(collector, str(save_path))
+        for step in tqdm.tqdm(range(args.max_episode_steps), desc="Recording episode", unit="step"):
+            # Store observation
+            observations.append(td["observation"].cpu().numpy())
+
+            # Get action
+            td = policy(td)
+            action = torch.argmax(td["action"], dim=-1).item()
+            actions.append(action)
+
+            # Step environment
+            td = env.step(td)
+
+            # Store reward
+            reward = td.get(("next", "reward"), torch.tensor(0.0)).item()
+            rewards.append(reward)
+
+            # Check for done
+            if td.get("done", torch.tensor(False)).item():
+                break
 
     env.close()
 
-    print("\n" + "="*60)
-    print("Data collection completed!")
-    print(f"Saved to: {save_path}")
-    print("="*60)
+    # Convert to arrays
+    observations = np.array(observations)
+    actions = np.array(actions)
+    rewards = np.array(rewards)
 
+    # Create plot
+    print(f"Creating plot with {len(observations)} timesteps...")
 
-def analyze_plot(args):
-    """Load npz data and generate PCA plots."""
-    print("="*60)
-    print("Plotting MPN-DQN PCA Analysis")
-    print("="*60)
+    fig, axs = plt.subplots(3, 1, figsize=(12, 8))
 
-    # Load experiment
-    exp_manager = ExperimentManager(args.experiment_name)
+    # Plot observations
+    axs[0].plot(observations)
+    axs[0].set_title("Observations")
+    axs[0].set_ylabel("Value")
+    axs[0].legend([f"Obs {i}" for i in range(observations.shape[1])], loc='upper right', ncol=observations.shape[1])
 
-    # Analysis directory
-    analysis_dir = exp_manager.exp_dir / "analysis"
-    if not analysis_dir.exists():
-        print(f"Error: Analysis directory not found: {analysis_dir}")
-        print("Run 'analyze collect' first to collect episode data.")
-        sys.exit(1)
+    # Plot actions
+    axs[1].step(range(len(actions)), actions, where='post')
+    axs[1].set_title("Actions")
+    axs[1].set_ylabel("Action")
+    axs[1].set_ylim(-0.5, action_dim - 0.5)
 
-    # Load npz data
-    npz_path = analysis_dir / "pca_data.npz"
-    if not npz_path.exists():
-        print(f"Error: Data file not found: {npz_path}")
-        print("Run 'analyze collect' first to collect episode data.")
-        sys.exit(1)
+    # Plot rewards
+    axs[2].plot(rewards)
+    axs[2].set_title(f"Rewards (Total: {np.sum(rewards):.2f})")
+    axs[2].set_ylabel("Reward")
+    axs[2].set_xlabel("Timestep")
 
-    print(f"Loading data from: {npz_path}\n")
-
-    from pca_analysis import load_collected_data, MPNPCAAnalyzer, plot_trajectories_2d
-
-    # Load data
-    data = load_collected_data(str(npz_path))
-
-    # Prepare pooled data for PCA
-    hidden_pooled = data['hidden_states']
-    M_pooled = data['M_matrices']
-    obs_pooled = data['observations']
-    episode_lengths = data['episode_lengths']
-
-    # Flatten M matrices for PCA
-    M_flat_pooled = M_pooled.reshape(M_pooled.shape[0], -1)
-
-    print(f"\nTotal timesteps: {hidden_pooled.shape[0]}")
-    print(f"Episode lengths - Mean: {np.mean(episode_lengths):.1f}, "
-          f"Min: {np.min(episode_lengths)}, Max: {np.max(episode_lengths)}")
-
-    # Perform PCA analysis
-    print("\n" + "-"*60)
-    print("Performing PCA Analysis...")
-    print("-"*60)
-
-    analyzer = MPNPCAAnalyzer()
-
-    # Determine number of components
-    hidden_dim = hidden_pooled.shape[1]
-    M_dim = M_flat_pooled.shape[1]
-    n_components_hidden = min(args.n_components, hidden_dim)
-    n_components_M = min(args.n_components, M_dim)
-
-    # Fit PCA on hidden states
-    if args.analyze_hidden:
-        analyzer.fit_hidden_pca(hidden_pooled, n_components=n_components_hidden)
-
-    # Fit PCA on M matrices
-    if args.analyze_M:
-        analyzer.fit_M_pca(M_flat_pooled, n_components=n_components_M)
-
-    # Plot variance explained
-    if args.plot_variance and (args.analyze_hidden or args.analyze_M):
-        print("\nPlotting explained variance...")
-        variance_path = analysis_dir / "pca_variance.png"
-        analyzer.plot_variance_explained(save_path=str(variance_path),
-                                        max_components=args.n_components)
-
-    # Plot trajectories
-    if args.plot_trajectories:
-        print("Plotting trajectories...")
-
-        # Transform pooled data to PC space
-        if args.analyze_hidden:
-            hidden_pcs_pooled = analyzer.transform_hidden(hidden_pooled)
-        if args.analyze_M:
-            M_pcs_pooled = analyzer.transform_M(M_flat_pooled)
-
-        # Split pooled data back into episodes using episode_lengths
-        def split_by_episodes(pooled_data, episode_lengths):
-            """Split pooled data into list of episode arrays."""
-            episodes = []
-            start_idx = 0
-            for length in episode_lengths:
-                episodes.append(pooled_data[start_idx:start_idx + length])
-                start_idx += length
-            return episodes
-
-        # Get colors based on feature (e.g., cart position)
-        colors_pooled = obs_pooled[:, args.color_feature]
-        colors_list = split_by_episodes(colors_pooled, episode_lengths)
-
-        # Feature names for CartPole
-        feature_names = ['Cart Position', 'Cart Velocity', 'Pole Angle', 'Pole Angular Velocity']
-        feature_filename = ['cart_position', 'cart_velocity', 'pole_angle', 'pole_angular_velocity']
-
-        color_label = feature_names[args.color_feature] if args.color_feature < 4 else f"Feature {args.color_feature}"
-        filename_suffix = feature_filename[args.color_feature] if args.color_feature < 4 else f"feature_{args.color_feature}"
-
-        # Hidden state trajectories
-        if args.analyze_hidden:
-            print("  - Hidden state trajectories...")
-            hidden_pcs_list = split_by_episodes(hidden_pcs_pooled, episode_lengths)
-
-            traj_path = analysis_dir / f"trajectories_hidden_{filename_suffix}.png"
-            plot_trajectories_2d(
-                hidden_pcs_list,
-                colors_list,
-                save_path=str(traj_path),
-                title="Hidden State Trajectories in PC Space",
-                color_label=color_label
-            )
-
-        # M matrix trajectories
-        if args.analyze_M:
-            print("  - M matrix trajectories...")
-            M_pcs_list = split_by_episodes(M_pcs_pooled, episode_lengths)
-
-            traj_path = analysis_dir / f"trajectories_M_{filename_suffix}.png"
-            plot_trajectories_2d(
-                M_pcs_list,
-                colors_list,
-                save_path=str(traj_path),
-                title="M Matrix Trajectories in PC Space",
-                color_label=color_label
-            )
-
-    print("\n" + "="*60)
-    print("Analysis completed!")
-    print(f"Results saved to: {analysis_dir}")
-    print("="*60)
-
-
-def analyze_agent(args):
-    """Analyze trained agent with PCA on hidden states and M matrices."""
-    print("="*60)
-    print("Analyzing MPN-DQN with PCA")
-    print("="*60)
-
-    # Load experiment
-    exp_manager = ExperimentManager(args.experiment_name)
-    config = exp_manager.load_config()
-
-    # Create analysis output directory
-    analysis_dir = exp_manager.exp_dir / "analysis"
-    analysis_dir.mkdir(exist_ok=True)
-
-    # Create environment
-    env = gym.make(config['env_name'], render_mode='rgb_array',
-                   max_episode_steps=args.max_episode_steps)
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-
-    # Setup device
-    device = get_device(args.device)
-    print()
-
-    # Create model
-    dqn = MPNDQN(
-        obs_dim=obs_dim,
-        hidden_dim=config['hidden_dim'],
-        action_dim=action_dim,
-        eta=config['eta'],
-        lambda_decay=config['lambda_decay'],
-        activation=config.get('activation', 'tanh')
-    ).to(device)
-
-    # Load checkpoint
-    checkpoint_name = args.checkpoint if args.checkpoint else "best_model.pt"
-    load_checkpoint_for_eval(exp_manager, dqn, checkpoint_name, device=str(device))
-
-    print(f"Loaded checkpoint: {checkpoint_name}")
-    print(f"Environment: {config['env_name']}")
-    print(f"Max episode steps: {args.max_episode_steps}")
-    print(f"Analyzing {args.num_episodes} episodes\n")
-
-    # Import PCA analysis tools
-    from pca_analysis import (collect_episodes, MPNPCAAnalyzer,
-                              plot_trajectories_2d, get_cartpole_colors)
-
-    # Collect episodes
-    print("Collecting episodes...")
-    collector = collect_episodes(dqn, env, args.num_episodes, device,
-                                 epsilon=0.0, max_steps=args.max_episode_steps)
-
-    data = collector.get_data()
-    pooled = collector.get_pooled_data()
-
-    print(f"\nCollected {len(data['hidden'])} episodes")
-    print(f"Total timesteps: {pooled['hidden'].shape[0]}")
-    print(f"Episode lengths - Mean: {np.mean(data['lengths']):.1f}, "
-          f"Min: {np.min(data['lengths'])}, Max: {np.max(data['lengths'])}")
-
-    # Perform PCA analysis
-    print("\n" + "-"*60)
-    print("Performing PCA Analysis...")
-    print("-"*60)
-
-    analyzer = MPNPCAAnalyzer()
-
-    # Determine number of components (use min of data dimension or requested)
-    hidden_dim = pooled['hidden'].shape[1]
-    M_dim = pooled['M_flat'].shape[1]
-    n_components_hidden = min(args.n_components, hidden_dim)
-    n_components_M = min(args.n_components, M_dim)
-
-    # Fit PCA on hidden states
-    if args.analyze_hidden:
-        analyzer.fit_hidden_pca(pooled['hidden'], n_components=n_components_hidden)
-
-    # Fit PCA on M matrices
-    if args.analyze_M:
-        analyzer.fit_M_pca(pooled['M_flat'], n_components=n_components_M)
-
-    # Plot variance explained
-    if args.plot_variance and (args.analyze_hidden or args.analyze_M):
-        print("\nPlotting explained variance...")
-        variance_path = analysis_dir / "pca_variance.png"
-        analyzer.plot_variance_explained(save_path=str(variance_path),
-                                        max_components=args.n_components)
-
-    # Plot trajectories
-    if args.plot_trajectories:
-        print("\nPlotting trajectories...")
-
-        # Get color feature for CartPole
-        feature_names = ['Cart Position', 'Cart Velocity', 'Pole Angle', 'Pole Angular Velocity']
-
-        if config['env_name'] == 'CartPole-v1' and args.color_feature < 4:
-            colors = get_cartpole_colors(data['obs'], feature_idx=args.color_feature)
-            color_label = feature_names[args.color_feature]
-        else:
-            # Default: color by episode index
-            colors = [np.full(len(obs), i) for i, obs in enumerate(data['obs'])]
-            color_label = "Episode Index"
-
-        # Transform episodes to PC space
-        if args.analyze_hidden and analyzer.hidden_pca is not None:
-            print("  - Hidden state trajectories...")
-            hidden_pcs_list = [analyzer.transform_hidden(h) for h in data['hidden']]
-
-            # Transform readout vectors to PC space
-            readout_weights = dqn.q_head.weight.detach().cpu().numpy()  # [n_actions, hidden_dim]
-            readout_pcs = analyzer.transform_hidden(readout_weights)
-
-            traj_path = analysis_dir / "trajectories_hidden.png"
-            plot_trajectories_2d(
-                hidden_pcs_list, colors,
-                pc_pairs=[(0, 1), (0, 2), (1, 2)],
-                title="Hidden State Trajectories in PC Space",
-                save_path=str(traj_path),
-                readout_pcs=readout_pcs,
-                color_label=color_label
-            )
-
-        if args.analyze_M and analyzer.M_pca is not None:
-            print("  - M matrix trajectories...")
-            M_pcs_list = [analyzer.transform_M(M.reshape(M.shape[0], -1)) for M in data['M']]
-
-            traj_path = analysis_dir / "trajectories_M.png"
-            plot_trajectories_2d(
-                M_pcs_list, colors,
-                pc_pairs=[(0, 1), (0, 2), (1, 2)],
-                title="M Matrix Trajectories in PC Space",
-                save_path=str(traj_path),
-                color_label=color_label
-            )
-
-    env.close()
-
-    print("\n" + "="*60)
-    print("Analysis completed!")
-    print(f"Results saved to: {analysis_dir}")
-    print("="*60)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    print(f"\nPlot saved to: {output_path}")
+    print(f"Episode reward: {np.sum(rewards):.2f}")
+    print(f"Episode length: {len(rewards)}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MPN-DQN: Multi-Plasticity Network with Deep Q-Learning")
+    parser = argparse.ArgumentParser(description="MPN-DQN with TorchRL")
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
 
-    # Train NeuroGym command
-    train_ng_parser = subparsers.add_parser('train-neurogym', help='Train on NeuroGym environment with trial-based replay')
-    train_ng_parser.add_argument('--experiment-name', type=str, default=None, help='Experiment name (random if not provided)')
-    train_ng_parser.add_argument('--env-name', type=str, default='ContextDecisionMaking-v0',
-                                 help='NeuroGym environment name (default: ContextDecisionMaking-v0)')
-    train_ng_parser.add_argument('--max-episode-steps', type=int, default=500,
-                                 help='Maximum steps per episode (default: 500, NeuroGym envs dont terminate naturally)')
-    train_ng_parser.add_argument('--num-episodes', type=int, default=1000, help='Number of training episodes')
-    train_ng_parser.add_argument('--model-type', type=str, default='mpn',
-                                 choices=['mpn', 'mpn-frozen', 'rnn'],
-                                 help='Model type: mpn (with plasticity), mpn-frozen (no plasticity), rnn (vanilla RNN baseline)')
-    train_ng_parser.add_argument('--hidden-dim', type=int, default=128, help='Hidden dimension for recurrent layer')
-    train_ng_parser.add_argument('--eta', type=float, default=0.1, help='Hebbian learning rate (MPN only)')
-    train_ng_parser.add_argument('--lambda-decay', type=float, default=0.95, help='M matrix decay factor (MPN only)')
-    train_ng_parser.add_argument('--activation', type=str, default='tanh', choices=['relu', 'tanh', 'sigmoid'], help='Activation function')
-    train_ng_parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
-
-    # Epsilon (exploration) parameters
-    train_ng_parser.add_argument('--epsilon-start', type=float, default=1.0, help='Initial exploration rate (default: 1.0 for full exploration)')
-    train_ng_parser.add_argument('--epsilon-end', type=float, default=0.01, help='Final/minimum exploration rate (default: 0.01)')
-    train_ng_parser.add_argument('--epsilon-decay-type', type=str, default='linear',
-                                 choices=['linear', 'exponential', 'step'],
-                                 help='Epsilon decay schedule type (default: linear). All reach epsilon_end in 30%% of episodes')
-
-    # Sequence replay buffer parameters
-    train_ng_parser.add_argument('--buffer-size', type=int, default=500, help='Replay buffer base size (actual capacity will be buffer_size * 100 transitions)')
-    train_ng_parser.add_argument('--sequence-length', type=int, default=10,
-                                 help='Fixed sequence length L (default: 10, paper uses 16)')
-    train_ng_parser.add_argument('--sequence-batch-size', type=int, default=32,
-                                 help='Number of sequences per batch (default: 32)')
-    train_ng_parser.add_argument('--train-freq', type=int, default=1,
-                                 help='Train every N environment steps (default: 1)')
-
-    train_ng_parser.add_argument('--learning-rate', type=float, default=0.00025, help='Learning rate (DRQN paper: 0.00025)')
-    train_ng_parser.add_argument('--grad-clip', type=float, default=10.0, help='Gradient clipping')
-    train_ng_parser.add_argument('--target-update-freq', type=int, default=10000, help='Target network update frequency in training steps (DRQN paper: 10000)')
-    train_ng_parser.add_argument('--checkpoint-freq', type=int, default=50, help='Checkpoint save frequency (episodes)')
-    train_ng_parser.add_argument('--print-freq', type=int, default=10, help='Print frequency (episodes)')
-    train_ng_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
-
-    # Resume command
-    resume_parser = subparsers.add_parser('resume', help='Resume training from checkpoint')
-    resume_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name to resume')
-    resume_parser.add_argument('--num-episodes', type=int, default=500, help='Additional episodes to train')
-    resume_parser.add_argument('--max-episode-steps', type=int, default=None, help='Maximum steps per episode (default: use from config)')
-    resume_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
+    # Train command
+    train_parser = subparsers.add_parser('train-neurogym', help='Train on NeuroGym environment')
+    train_parser.add_argument('--experiment-name', type=str, default=None, help='Experiment name (random if not provided)')
+    train_parser.add_argument('--env-name', type=str, default='GoNogo-v0', help='NeuroGym environment name')
+    train_parser.add_argument('--max-episode-steps', type=int, default=500, help='Maximum steps per episode')
+    train_parser.add_argument('--total-frames', type=int, default=50000, help='Total number of training frames')
+    train_parser.add_argument('--model-type', type=str, default='mpn',
+                             choices=['mpn', 'mpn-frozen', 'rnn'],
+                             help='Model type: mpn, mpn-frozen (no plasticity), rnn')
+    train_parser.add_argument('--hidden-dim', type=int, default=64, help='Hidden dimension')
+    train_parser.add_argument('--num-layers', type=int, default=1, help='Number of recurrent layers')
+    train_parser.add_argument('--eta', type=float, default=0.1, help='Hebbian learning rate (MPN only)')
+    train_parser.add_argument('--lambda-decay', type=float, default=0.95, help='M matrix decay (MPN only)')
+    train_parser.add_argument('--activation', type=str, default='tanh',
+                             choices=['relu', 'tanh', 'sigmoid'], help='Activation function')
+    train_parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    train_parser.add_argument('--epsilon-start', type=float, default=0.2, help='Initial exploration rate')
+    train_parser.add_argument('--epsilon-end', type=float, default=0.01, help='Final exploration rate')
+    train_parser.add_argument('--frames-per-batch', type=int, default=50, help='Frames per collection batch')
+    train_parser.add_argument('--buffer-size', type=int, default=20000, help='Replay buffer capacity')
+    train_parser.add_argument('--batch-size', type=int, default=4, help='Training batch size')
+    train_parser.add_argument('--utd', type=int, default=64, help='Updates-to-data ratio')
+    train_parser.add_argument('--learning-rate', type=float, default=3e-4, help='Learning rate')
+    train_parser.add_argument('--grad-clip', type=float, default=10.0, help='Gradient clipping')
+    train_parser.add_argument('--target-update-tau', type=float, default=0.95, help='Target network soft update tau')
+    train_parser.add_argument('--checkpoint-freq', type=int, default=5000, help='Checkpoint frequency (frames)')
+    train_parser.add_argument('--print-freq', type=int, default=500, help='Print and evaluation frequency (frames)')
+    train_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu')
 
     # Eval command
     eval_parser = subparsers.add_parser('eval', help='Evaluate trained agent')
     eval_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name')
     eval_parser.add_argument('--num-eval-episodes', type=int, default=10, help='Number of evaluation episodes')
     eval_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load (default: best_model.pt)')
-    eval_parser.add_argument('--max-episode-steps', type=int, default=2000, help='Maximum steps per episode (default: 2000)')
-    eval_parser.add_argument('--render', action='store_true', help='Render episodes')
-    eval_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
+    eval_parser.add_argument('--max-episode-steps', type=int, default=500, help='Maximum steps per episode')
+    eval_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu')
 
     # Render command
-    render_parser = subparsers.add_parser('render', help='Render episode to GIF')
+    render_parser = subparsers.add_parser('render', help='Render episode to plot')
     render_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name')
-    render_parser.add_argument('--output', type=str, default=None, help='Output GIF path (default: experiments/{name}/videos/render.gif)')
+    render_parser.add_argument('--output', type=str, default=None, help='Output path (default: experiments/{name}/plots/episode_render.png)')
     render_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load (default: best_model.pt)')
-    render_parser.add_argument('--max-episode-steps', type=int, default=2000, help='Maximum steps per episode (default: 2000)')
-    render_parser.add_argument('--fps', type=int, default=30, help='Frames per second')
-    render_parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility')
-
-    # Analyze command with subcommands
-    analyze_parser = subparsers.add_parser('analyze', help='Analyze agent with PCA')
-    analyze_subparsers = analyze_parser.add_subparsers(dest='analyze_command', help='Analyze subcommand')
-
-    # Analyze collect subcommand
-    analyze_collect_parser = analyze_subparsers.add_parser('collect', help='Collect episode data and save to npz')
-    analyze_collect_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name')
-    analyze_collect_parser.add_argument('--num-episodes', type=int, default=100, help='Number of episodes to collect')
-    analyze_collect_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load (default: best_model.pt)')
-    analyze_collect_parser.add_argument('--max-episode-steps', type=int, default=2000, help='Maximum steps per episode (default: 2000)')
-    analyze_collect_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu (default: auto)')
-
-    # Analyze plot subcommand
-    analyze_plot_parser = analyze_subparsers.add_parser('plot', help='Load npz data and generate PCA plots')
-    analyze_plot_parser.add_argument('--experiment-name', type=str, required=True, help='Experiment name')
-    analyze_plot_parser.add_argument('--n-components', type=int, default=100, help='Number of PCA components')
-    analyze_plot_parser.add_argument('--analyze-hidden', action='store_true', default=True, help='Analyze hidden states')
-    analyze_plot_parser.add_argument('--analyze-M', action='store_true', default=True, help='Analyze M matrices')
-    analyze_plot_parser.add_argument('--plot-variance', action='store_true', default=True, help='Plot explained variance')
-    analyze_plot_parser.add_argument('--plot-trajectories', action='store_true', default=True, help='Plot PC trajectories')
-    analyze_plot_parser.add_argument('--color-feature', type=int, default=0,
-                               help='CartPole feature for coloring (0=pos, 1=vel, 2=angle, 3=ang_vel)')
+    render_parser.add_argument('--max-episode-steps', type=int, default=500, help='Maximum steps per episode')
 
     args = parser.parse_args()
 
     if args.command == 'train-neurogym':
         train_neurogym(args)
-    elif args.command == 'resume':
-        resume_training(args)
     elif args.command == 'eval':
         evaluate(args)
     elif args.command == 'render':
-        render_to_gif(args)
-    elif args.command == 'analyze':
-        if args.analyze_command == 'collect':
-            analyze_collect(args)
-        elif args.analyze_command == 'plot':
-            analyze_plot(args)
-        else:
-            analyze_parser.print_help()
+        render_to_plot(args)
     else:
         parser.print_help()
 

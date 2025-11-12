@@ -677,31 +677,30 @@ class ExperimentManager:
         """Load training history."""
         if not self.history_path.exists():
             return {
-                'episodes': [],
+                'frames': [],
                 'rewards': [],
                 'lengths': [],
                 'losses': [],
                 'epsilons': [],
-                'trials': []
             }
         with open(self.history_path, 'r') as f:
             history = json.load(f)
-            # Ensure 'trials' field exists for backward compatibility
-            if 'trials' not in history:
-                history['trials'] = []
+            # Ensure 'frames' field exists for backward compatibility with old 'episodes' format
+            if 'frames' not in history and 'episodes' in history:
+                history['frames'] = history['episodes']
+            if 'frames' not in history:
+                history['frames'] = []
             return history
 
-    def append_training_history(self, episode: int, reward: float,
-                                length: int, loss: float, epsilon: float,
-                                num_trials: int = 0):
+    def append_training_history(self, frames: int, reward: float,
+                                length: int, loss: float, epsilon: float):
         """Append new data to training history."""
         history = self.load_training_history()
-        history['episodes'].append(episode)
+        history['frames'].append(frames)
         history['rewards'].append(reward)
         history['lengths'].append(length)
         history['losses'].append(loss)
         history['epsilons'].append(epsilon)
-        history['trials'].append(num_trials)
         self.save_training_history(history)
 
     def get_best_checkpoint(self) -> Optional[str]:
