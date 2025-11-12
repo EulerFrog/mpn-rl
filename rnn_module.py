@@ -244,10 +244,24 @@ class RNNModule(ModuleBase):
         dtype,
         hidden_in: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Internal RNN forward pass.
 
-        if not self.recurrent_mode and steps != 1:
-            raise ValueError("Expected a single step")
+        PyTorch's nn.RNN can efficiently process multi-step sequences,
+        so we support both steps=1 (rollout) and steps>1 (training with sequences).
 
+        Args:
+            input: [batch, steps, input_size]
+            batch: batch size
+            steps: number of time steps in the sequence
+            device: device
+            dtype: data type
+            hidden_in: [batch, steps, num_layers, hidden_size] or None
+
+        Returns:
+            output: [batch, steps, hidden_size]
+            hidden_out: [batch, steps, num_layers, hidden_size]
+        """
         if hidden_in is None:
             shape = (batch, steps)
             hidden_in = torch.zeros(
@@ -262,11 +276,18 @@ class RNNModule(ModuleBase):
         _hidden_in = hidden_in[:, 0]
         hidden = _hidden_in.transpose(-3, -2).contiguous()
 
+        # PyTorch's nn.RNN processes all steps at once
+        # input: [batch, steps, input_size]
+        # hidden: [num_layers, batch, hidden_size]
+        # output y: [batch, steps, hidden_size]
+        # output hidden: [num_layers, batch, hidden_size] (state after last step)
         y, hidden = self.rnn(input, hidden)
+
         # dim 0 in hidden is num_layers, but that will conflict with tensordict
         hidden = hidden.transpose(0, 1)
 
         # we pad the hidden states with zero to make tensordict happy
+        # Following LSTM pattern: zeros for all steps except last
         hidden = torch.stack(
             [torch.zeros_like(hidden) for _ in range(steps - 1)] + [hidden],
             1,

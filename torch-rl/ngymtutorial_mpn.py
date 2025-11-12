@@ -1,4 +1,7 @@
 import multiprocessing
+import os
+# Import our MPNModule
+import sys
 import time
 
 import imageio
@@ -21,12 +24,12 @@ from torchrl.modules import (MLP, ConvNet, EGreedyModule, LSTMModule,
                              QValueModule)
 from torchrl.objectives import DQNLoss, SoftUpdate
 
-# Import our MPNModule
-import sys
-sys.path.append('/home/eulerfrog/KAM/mpn-rl')
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mpn_torchrl_module import MPNModule
+from neurogym_transform import NeuroGymInfoTransform
+from neurogym_wrapper import NeuroGymInfoWrapper
 
-TOTAL_FRAMES = 50_000
+TOTAL_FRAMES = 10_000
 global exit
 exit = False
 
@@ -51,12 +54,16 @@ print(f"Using device: {device}")
 
 
 
-# transforms environment so that only pixels are shown
+# Create environment with NeuroGym wrapper for proper ground truth handling
+gymenv = GymEnv("DelayMatchSample-v0", device=device)
+gymenv._env = NeuroGymInfoWrapper(gymenv._env)
+
 env = TransformedEnv(
-    GymEnv("GoNogo-v0", device=device),
+    gymenv,
     Compose(
         StepCounter(),
         InitTracker(),
+        NeuroGymInfoTransform(),
     )
 )
 
@@ -74,6 +81,7 @@ mpn1 = MPNModule(
     hidden_size=64,
     device=device,
     activation='tanh',
+    freeze_plasticity = False,
     in_keys=["observation", "recurrent_state_m1"],
     out_keys=["embed1", ("next", "recurrent_state_m1")],
 )
@@ -83,6 +91,7 @@ mpn2 = MPNModule(
     hidden_size=64,
     device=device,
     activation='tanh',
+    freeze_plasticity = False,
     in_keys=["embed1", "recurrent_state_m2"],
     out_keys=["embed2", ("next", "recurrent_state_m2")],
 )
@@ -92,6 +101,7 @@ mpn3 = MPNModule(
     hidden_size=64,
     device=device,
     activation='tanh',
+    freeze_plasticity = False,
     in_keys=["embed2", "recurrent_state_m3"],
     out_keys=["embed3", ("next", "recurrent_state_m3")],
 )
@@ -102,13 +112,14 @@ mpn3 = MPNModule(
 # print("MPN2 in_keys:", mpn2.in_keys)
 # print("MPN2 out_keys:", mpn2.out_keys)
 
-# Add primers for both MPN modules
+# Add primers for all MPN modules
 env.append_transform(mpn1.make_tensordict_primer())
 env.append_transform(mpn2.make_tensordict_primer())
+env.append_transform(mpn3.make_tensordict_primer())
 
 
 mlp = MLP(
-    out_features=2,
+    out_features=3,
     num_cells=[
         64,
     ],
@@ -215,7 +226,7 @@ listener.stop()
 
 sample_trajectory = sample_trajectory.cpu()
 
-labels = ["fixation","nogo","go","action"]
+labels = ["fixation","mod1","mod2","action"]
 plt.rcParams['font.family'] = 'serif'  # or 'sans-serif', 'monospace', etc.
 
 fig, axs = plt.subplots(2,1)
@@ -229,10 +240,14 @@ for i in range(4):
 axs[1].plot(sample_trajectory[:length, 4])
 axs[1].set_title("Reward")
 axs[0].legend()
-plt.savefig('/home/eulerfrog/KAM/mpn-rl/mpn_ngym_trajectory.png')
+
+# Save plots to the parent directory (mpn-rl root)
+output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+trajectory_path = os.path.join(output_dir, 'mpn_ngym_trajectory.png')
+plt.savefig(trajectory_path)
 plt.close()
 
-print(f"Saved trajectory plot to mpn_ngym_trajectory.png")
+print(f"Saved trajectory plot to {trajectory_path}")
 print(f"Misses: {misses}")
 
 fig, axs = plt.subplots(3,1, figsize=(10, 8))
@@ -244,8 +259,10 @@ axs[1].set_title("Reward")
 axs[2].plot(misses)
 axs[2].set_title("Misses")
 plt.tight_layout()
-plt.savefig('/home/eulerfrog/KAM/mpn-rl/mpn_ngym_training.png')
+
+training_path = os.path.join(output_dir, 'mpn_ngym_training.png')
+plt.savefig(training_path)
 plt.close()
 
-print(f"Saved training plots to mpn_ngym_training.png")
+print(f"Saved training plots to {training_path}")
 print("\nMPN training completed successfully!")

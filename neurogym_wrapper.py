@@ -28,15 +28,8 @@ class NeuroGymInfoWrapper(gym.Wrapper):
         # When new_trial=True, info['gt'] is already for the NEXT trial
         # Replace it with the captured GT from the completed trial
         if info.get('new_trial', False):
-            original_gt = info.get('gt', -1)
             if self._current_trial_gt is not None:
                 info['gt'] = self._current_trial_gt
-                # DEBUG: Print first few corrections
-                if not hasattr(self, '_debug_count'):
-                    self._debug_count = 0
-                self._debug_count += 1
-                if self._debug_count <= 5:
-                    print(f"[DEBUG Wrapper] Trial {self._debug_count}: Corrected GT from {original_gt} → {self._current_trial_gt}, reward={reward:.2f}")
 
         self._last_info = info
         return obs, reward, done, truncated, info

@@ -129,26 +129,37 @@ class MPNLayer(nn.Module):
         else:
             M = state
 
-        # Compute modulated weights: W * (M + 1)
-        # W shape: [hidden_dim, input_dim]
-        # M shape: [batch_size, hidden_dim, input_dim]
-        # Result: [batch_size, hidden_dim, input_dim]
-        W_modulated = self.W.unsqueeze(0) * (M + 1.0)
-
-        # Compute pre-activation: b + W_modulated @ x
-        # x shape: [batch_size, input_dim, 1]
-        # W_modulated @ x: [batch_size, hidden_dim, 1]
-        # Result: [batch_size, hidden_dim]
-        y_tilde = self.b.unsqueeze(0) + torch.bmm(W_modulated, x.unsqueeze(2)).squeeze(2)
-
-        # Apply activation
-        h = self.activation(y_tilde)
-
-        # Hebbian update: M_new = λ*M + η*h*x^T
-        # If freeze_plasticity is True, keep M at zero (no memory/context)
+        # When plasticity is frozen, M is always zero, so W_modulated = W
+        # This optimization avoids unnecessary computation
         if self.freeze_plasticity:
-            M_new = M  # Keep at zero (no update)
+            # Simplified computation: W @ x + b (M is always zero)
+            # W shape: [hidden_dim, input_dim]
+            # x shape: [batch_size, input_dim]
+            # Result: [batch_size, hidden_dim]
+            y_tilde = torch.nn.functional.linear(x, self.W, self.b)
+
+            # Apply activation
+            h = self.activation(y_tilde)
+
+            # Return zeros for M (detached to save memory)
+            M_new = torch.zeros_like(M).detach()
         else:
+            # Compute modulated weights: W * (M + 1)
+            # W shape: [hidden_dim, input_dim]
+            # M shape: [batch_size, hidden_dim, input_dim]
+            # Result: [batch_size, hidden_dim, input_dim]
+            W_modulated = self.W.unsqueeze(0) * (M + 1.0)
+
+            # Compute pre-activation: b + W_modulated @ x
+            # x shape: [batch_size, input_dim, 1]
+            # W_modulated @ x: [batch_size, hidden_dim, 1]
+            # Result: [batch_size, hidden_dim]
+            y_tilde = self.b.unsqueeze(0) + torch.bmm(W_modulated, x.unsqueeze(2)).squeeze(2)
+
+            # Apply activation
+            h = self.activation(y_tilde)
+
+            # Hebbian update: M_new = λ*M + η*h*x^T
             # h shape: [batch_size, hidden_dim, 1]
             # x shape: [batch_size, 1, input_dim]
             # h @ x^T: [batch_size, hidden_dim, input_dim]

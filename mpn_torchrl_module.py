@@ -269,7 +269,7 @@ class MPNModule(ModuleBase):
         Args:
             input: [batch, steps, input_size]
             batch: batch size
-            steps: number of steps (should be 1 in non-recurrent mode)
+            steps: number of time steps in the sequence
             device: device
             dtype: data type
             state_m_in: [batch, steps, hidden_size, input_size] or None
@@ -278,9 +278,6 @@ class MPNModule(ModuleBase):
             output: [batch, steps, hidden_size]
             state_m_out: [batch, steps, hidden_size, input_size]
         """
-        if steps != 1:
-            raise ValueError("MPNModule currently only supports single-step (steps=1)")
-
         # Initialize state if not provided
         if state_m_in is None:
             state_m_in = torch.zeros(
@@ -289,22 +286,51 @@ class MPNModule(ModuleBase):
                 device=device, dtype=dtype
             )
 
-        # Extract first (and only) step: [batch, steps, ...] -> [batch, ...]
-        # This matches LSTM pattern at line 785-786
-        _state_m_in = state_m_in[:, 0]  # [batch, hidden_size, input_size]
-        _input = input[:, 0]  # [batch, input_size]
+        # Extract initial state (first timestep)
+        # This matches LSTM pattern at line 791-792
+        _state_m = state_m_in[:, 0]  # [batch, hidden_size, input_size]
 
-        # Forward through MPN layer
-        hidden, new_state_m = self.mpn_layer(_input, _state_m_in)
+        # When plasticity is frozen, state is always zero (optimization)
+        if self.freeze_plasticity:
+            # Process all steps without updating state (it stays zero)
+            outputs = []
+            for t in range(steps):
+                _input_t = input[:, t]
+                hidden_t, _ = self.mpn_layer(_input_t, _state_m)  # state is ignored
+                outputs.append(hidden_t)
 
-        # Pad output to match steps dimension
-        # This matches LSTM pattern at line 798-802
-        # Output shape: [batch, steps, hidden_size]
-        output = hidden.unsqueeze(1)  # [batch, 1, hidden_size]
+            # Stack outputs
+            output = torch.stack(outputs, dim=1)
 
-        # Pad state_m: [batch, steps, hidden_size, input_size]
-        # Zeros for all steps except last
-        state_m_out = new_state_m.unsqueeze(1)  # [batch, 1, hidden_size, input_size]
+            # Return all-zero state (detached for memory efficiency)
+            state_m_out = torch.zeros(
+                batch, steps, self.hidden_size, self.input_size,
+                device=device, dtype=dtype
+            ).detach()
+        else:
+            # Process sequence step by step
+            # MPN must process sequentially to maintain Hebbian plasticity updates across time
+            outputs = []
+
+            for t in range(steps):
+                # Get input at timestep t: [batch, input_size]
+                _input_t = input[:, t]
+
+                # Forward through MPN layer
+                hidden_t, _state_m = self.mpn_layer(_input_t, _state_m)
+
+                # Collect output: [batch, hidden_size]
+                outputs.append(hidden_t)
+
+            # Stack outputs: [batch, steps, hidden_size]
+            output = torch.stack(outputs, dim=1)
+
+            # Pad state_m to match TorchRL format: [batch, steps, hidden_size, input_size]
+            # Following LSTM pattern at line 803-808: zeros for all steps except last
+            state_m_out = torch.stack(
+                [torch.zeros_like(_state_m) for _ in range(steps - 1)] + [_state_m],
+                dim=1
+            )
 
         return output, state_m_out
 

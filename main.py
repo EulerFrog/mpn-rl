@@ -21,33 +21,33 @@ Examples:
 """
 
 import argparse
-import sys
 import math
-import torch
-import numpy as np
+import sys
 from pathlib import Path
-import neurogym
-import tqdm
 
+# Matplotlib for rendering
+import matplotlib.pyplot as plt
+import neurogym
+import numpy as np
+import torch
+import tqdm
 # TorchRL imports
-from tensordict.nn import TensorDictModule as Mod, TensorDictSequential as Seq
+from tensordict.nn import TensorDictModule as Mod
+from tensordict.nn import TensorDictSequential as Seq
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import LazyMemmapStorage, TensorDictReplayBuffer
-from torchrl.envs import (Compose, ExplorationType, InitTracker,
+from torchrl.envs import (Compose, ExplorationType, InitTracker, ParallelEnv,
                           StepCounter, TransformedEnv, set_exploration_type)
 from torchrl.envs.libs.gym import GymEnv
-from torchrl.modules import MLP, EGreedyModule, QValueModule
+from torchrl.modules import MLP, EGreedyModule, LSTMModule, QValueModule
 from torchrl.objectives import DQNLoss, SoftUpdate
 
 # Local imports
 from model_utils import ExperimentManager
 from mpn_torchrl_module import MPNModule
-from rnn_module import RNNModule
 from neurogym_transform import NeuroGymInfoTransform
 from neurogym_wrapper import NeuroGymInfoWrapper
-
-# Matplotlib for rendering
-import matplotlib.pyplot as plt
+from rnn_module import RNNModule
 
 
 def get_epsilon_for_annealing(total_frames, epsilon_start, epsilon_end, annealing_frames=None):
@@ -68,31 +68,30 @@ def get_epsilon_for_annealing(total_frames, epsilon_start, epsilon_end, annealin
     return annealing_frames
 
 
-def get_device(device_str='auto'):
+def get_device(device_str='cpu'):
     """
-    Get PyTorch device with automatic GPU detection.
+    Get PyTorch device.
 
     Args:
-        device_str: 'auto', 'cuda', 'cpu', or specific device like 'cuda:0'
+        device_str: 'gpu' or 'cpu'
 
     Returns:
         torch.device
     """
-    if device_str == 'auto':
-        if torch.cuda.is_available():
-            device = torch.device('cuda')
-            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        else:
-            device = torch.device('cpu')
-            print("GPU not available, using CPU")
-    else:
-        device = torch.device(device_str)
-        if device.type == 'cuda' and torch.cuda.is_available():
-            print(f"Using GPU: {torch.cuda.get_device_name(device.index or 0)}")
-        elif device.type == 'cuda':
-            print("Warning: CUDA device requested but not available, falling back to CPU")
-            device = torch.device('cpu')
+    # Map 'gpu' to 'cuda' before creating device
+    if device_str == 'gpu':
+        device_str = 'cuda'
+
+    device = torch.device(device_str)
+
+    if device.type == 'cuda' and torch.cuda.is_available():
+        print(f"Using GPU: {torch.cuda.get_device_name(device.index or 0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(device.index or 0).total_memory / 1e9:.2f} GB")
+    elif device.type == 'cuda':
+        print("Warning: GPU requested but not available, falling back to CPU")
+        device = torch.device('cpu')
+    elif device.type == 'cpu':
+        print("Using CPU")
 
     return device
 
@@ -103,7 +102,7 @@ def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, act
 
     Args:
         env: Environment (for getting observation/action dimensions)
-        model_type: 'mpn', 'mpn-frozen', or 'rnn'
+        model_type: 'mpn', 'mpn-frozen', 'rnn', or 'lstm'
         hidden_dim: Hidden layer dimension
         num_layers: Number of recurrent layers to stack
         eta: Hebbian learning rate (MPN only)
@@ -120,6 +119,7 @@ def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, act
 
     # Determine model configuration
     use_rnn = (model_type == 'rnn')
+    use_lstm = (model_type == 'lstm')
     freeze_plasticity = (model_type == 'mpn-frozen')
 
     # Create stacked recurrent layers
@@ -132,6 +132,18 @@ def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, act
             hidden_size=hidden_dim,
             num_layers=num_layers,
             nonlinearity=activation,
+            device=device,
+            in_key="observation",
+            out_key=f"embed_{num_layers-1}",
+        )
+        layers.append(recurrent_module)
+        env.append_transform(recurrent_module.make_tensordict_primer())
+    elif use_lstm:
+        # LSTM supports multiple layers natively
+        recurrent_module = LSTMModule(
+            input_size=obs_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
             device=device,
             in_key="observation",
             out_key=f"embed_{num_layers-1}",
@@ -183,76 +195,44 @@ def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, act
     return policy
 
 
-def evaluate_policy(policy, env, num_steps, device):
+def evaluate_policy(policy, eval_env, num_steps, num_episodes=1):
     """
-    Evaluate policy on GoNogo task by doing a rollout for a fixed number of steps.
+    Evaluate policy by doing multiple rollouts and averaging rewards.
 
-    Uses ground truth ('gt') and trial completion ('new_trial') to properly count:
-    - True Positives (TP): Correct Go responses (reward = +1.0, gt = 1)
-    - False Negatives (FN): Missed Go trials (no response when gt = 1)
-    - True Negatives (TN): Correct No-go (no response when gt = 0)
-    - False Positives (FP): Incorrect No-go responses (reward = -0.5, gt = 0)
+    Args:
+        policy: The policy network to evaluate
+        eval_env: The evaluation environment (can be single or parallel)
+        num_steps: Number of steps to run per episode
+        num_episodes: Number of episodes (only used for reporting, env should match)
 
     Returns:
-        accuracy: (TP + TN) / total_trials
-        true_positives: Number of correct Go responses (TP)
-        true_negatives: Number of correct No-go rejections (TN)
-        false_negatives: Number of missed Go trials (FN)
-        false_positives: Number of incorrect No-go responses (FP)
-        total_reward: Total cumulative reward
-        total_trials: Total number of completed trials
+        avg_reward: Average total reward across all episodes
+        std_reward: Standard deviation of rewards across episodes
     """
     policy.eval()
 
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-        # Do a full rollout
-        rollout = env.rollout(num_steps, policy)
+        # Do rollout(s) on the eval environment
+        rollout = eval_env.rollout(num_steps, policy)
 
-        # Extract data from rollout as numpy arrays
+        # Extract rewards from rollout
         rewards = rollout.get(("next", "reward"))
         rewards = rewards.cpu().numpy() if torch.is_tensor(rewards) else np.array(rewards)
-        rewards = rewards.squeeze()  # Remove extra dimensions
 
-        # Get ground truth and new_trial flags (both in "next" dict)
-        gt = rollout.get(("next", "gt"))
-        gt = gt.cpu().numpy() if torch.is_tensor(gt) else np.array(gt)
-
-        new_trial = rollout.get(("next", "new_trial"))
-        new_trial = new_trial.cpu().numpy() if torch.is_tensor(new_trial) else np.array(new_trial)
-
-        # Count trial outcomes at trial completion points
-        # Exclude abort trials (reward = -0.1) from analysis
-        trial_complete_mask = new_trial.astype(bool)
-        abort_mask = (rewards > -0.2) & (rewards < -0.05)  # reward ~ -0.1
-        valid_trial_mask = trial_complete_mask & ~abort_mask
-
-        # Go trials (gt == 1) and No-go trials (gt == 0)
-        go_trial_mask = (gt == 1) & valid_trial_mask
-        nogo_trial_mask = (gt == 0) & valid_trial_mask
-
-        # True Positives: correct Go responses (reward > 0 at Go trial completion)
-        true_positives = ((rewards > 0.5) & go_trial_mask).sum()
-
-        # False Negatives: failed to respond on Go trials (reward == 0 at Go trial completion)
-        false_negatives = ((rewards == 0) & go_trial_mask).sum()
-
-        # True Negatives: correctly withheld on No-go trials (reward == 0 at No-go completion)
-        true_negatives = ((rewards == 0) & nogo_trial_mask).sum()
-
-        # False Positives: incorrectly responded on No-go trials (reward < 0, excluding aborts)
-        false_positives = ((rewards < -0.4) & nogo_trial_mask).sum()
-
-        # Total trials (excluding aborts)
-        total_trials = valid_trial_mask.sum()
-
-        # Calculate accuracy
-        accuracy = (true_positives + true_negatives) / total_trials if total_trials > 0 else 0.0
-
-        # Total reward
-        total_reward = rewards.sum()
-
-    policy.train()
-    return accuracy, int(true_positives), int(true_negatives), int(false_negatives), int(false_positives), float(total_reward), int(total_trials)
+        if num_episodes == 1:
+            # Single episode - sum all rewards
+            rewards = rewards.squeeze()
+            total_reward = float(rewards.sum())
+            policy.train()
+            return total_reward, 0.0
+        else:
+            # Multiple episodes - sum each episode and compute stats
+            # rewards shape is [num_episodes, num_steps] after rollout
+            episode_rewards = rewards.sum(axis=1)  # Sum over time dimension
+            avg_reward = float(np.mean(episode_rewards))
+            std_reward = float(np.std(episode_rewards))
+            policy.train()
+            return avg_reward, std_reward
 
 
 def train_neurogym(args):
@@ -278,20 +258,25 @@ def train_neurogym(args):
     # Create NeuroGym environment using TorchRL's GymEnv
     print(f"Creating NeuroGym environment: {args.env_name}")
 
-    # Create GymEnv first with the env name
-    gymenv = GymEnv(args.env_name, device=device)
-
-    # Then wrap the internal gym environment to capture info dict
-    gymenv._env = NeuroGymInfoWrapper(gymenv._env)
-
-    env = TransformedEnv(
-        gymenv,
-        Compose(
-            StepCounter(max_steps=args.max_episode_steps),
-            InitTracker(),
-            NeuroGymInfoTransform(),  # Extract gt and new_trial from info
+    # Create environment factory function for parallel evaluation
+    def make_env():
+        gymenv = GymEnv(args.env_name, device=device)
+        gymenv._env = NeuroGymInfoWrapper(gymenv._env)
+        return TransformedEnv(
+            gymenv,
+            Compose(
+                StepCounter(max_steps=args.max_episode_steps),
+                InitTracker(),
+                NeuroGymInfoTransform(),
+            )
         )
-    )
+
+    # Create main training environment (parallel if num_envs > 1)
+    if args.num_envs > 1:
+        print(f"Creating {args.num_envs} parallel training environments")
+        env = ParallelEnv(args.num_envs, make_env, device=device)
+    else:
+        env = make_env()
 
     # Get environment dimensions
     obs_dim = env.observation_spec["observation"].shape[-1]
@@ -299,6 +284,7 @@ def train_neurogym(args):
 
     # Print model configuration
     use_rnn = (args.model_type == 'rnn')
+    use_lstm = (args.model_type == 'lstm')
     freeze_plasticity = (args.model_type == 'mpn-frozen')
 
     print(f"Algorithm: DQN with TorchRL")
@@ -309,6 +295,8 @@ def train_neurogym(args):
 
     if use_rnn:
         print(f"RNN: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}, activation={args.activation}\n")
+    elif use_lstm:
+        print(f"LSTM: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}\n")
     else:
         print(f"MPN: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}, eta={args.eta}, lambda={args.lambda_decay}")
         print(f"Activation: {args.activation}, Plasticity frozen: {freeze_plasticity}\n")
@@ -380,19 +368,21 @@ def train_neurogym(args):
     print("Starting training...")
     print("-"*60)
 
-    # Training metrics
-    batch_rewards = []
-    batch_losses = []
-    best_accuracy = -float('inf')
-    frames_collected = 0
+    # Create evaluation environment (parallel if num_eval_episodes > 1)
+    if args.num_eval_episodes > 1:
+        print(f"Creating {args.num_eval_episodes} parallel evaluation environments")
+        eval_env = ParallelEnv(args.num_eval_episodes, make_env, device=device)
+    else:
+        eval_env = make_env()
 
-    # Evaluation metrics tracking
-    eval_accuracies = []
-    eval_true_positives = []
-    eval_true_negatives = []
-    eval_false_negatives = []
-    eval_false_positives = []
-    eval_total_trials = []
+    # Training metrics
+    eval_rewards = []
+    eval_reward_stds = []
+    eval_losses = []
+    recent_losses = []  # Track losses between evaluations
+    best_reward = -float('inf')
+    frames_collected = 0
+    last_eval_frame = 0
 
     # Progress bar
     pbar = tqdm.tqdm(total=total_frames, desc="Training", unit="frames")
@@ -401,6 +391,7 @@ def train_neurogym(args):
     for i, data in enumerate(collector):
         # Add data to replay buffer
         replay_buffer.extend(data.unsqueeze(0).to_tensordict().cpu())
+        
 
         frames_collected += data.numel()
 
@@ -425,69 +416,57 @@ def train_neurogym(args):
         exploration_module.step(data.numel())
 
         # Track metrics per batch
-        batch_reward = data["next", "reward"].sum().item()
         batch_loss = np.mean(batch_loss_vals) if batch_loss_vals else 0.0
         # Convert epsilon to Python float (may be tensor)
         current_epsilon = float(exploration_module.eps.item()) if torch.is_tensor(exploration_module.eps) else float(exploration_module.eps)
 
-        # Store metrics
-        batch_rewards.append(batch_reward)
+        # Store recent losses for evaluation logging
         if batch_loss_vals:
-            batch_losses.append(batch_loss)
+            recent_losses.append(batch_loss)
 
         # Update progress bar
         pbar.update(data.numel())
         pbar.set_postfix({
-            'reward': f'{batch_reward:.2f}',
             'loss': f'{batch_loss:.4f}',
             'eps': f'{current_epsilon:.3f}',
             'buffer': len(replay_buffer)
         })
 
-        # Save to history every batch
-        exp_manager.append_training_history(
-            int(frames_collected),
-            float(batch_reward),
-            int(data.numel()),
-            float(batch_loss),
-            float(current_epsilon)
-        )
-
         # Print progress and evaluate every N frames
-        if frames_collected % args.print_freq == 0 and frames_collected > 0:
+        if frames_collected - last_eval_frame >= args.print_freq:
             # Run evaluation rollout (using max_episode_steps)
-            eval_accuracy, eval_tp, eval_tn, eval_fn, eval_fp, eval_total_reward, eval_trials = evaluate_policy(
-                policy, env, args.max_episode_steps, device
+            eval_reward, eval_reward_std = evaluate_policy(policy, eval_env, args.max_episode_steps, args.num_eval_episodes)
+
+            # Calculate average loss since last evaluation
+            avg_loss = np.mean(recent_losses) if recent_losses else 0.0
+
+            # Store evaluation metrics (aligned arrays)
+            eval_rewards.append(eval_reward)
+            eval_reward_stds.append(eval_reward_std)
+            eval_losses.append(avg_loss)
+
+            # Save to history
+            exp_manager.append_training_history(
+                int(frames_collected),
+                float(eval_reward),
+                int(data.numel()),
+                float(avg_loss),
+                float(current_epsilon)
             )
-
-            # Store evaluation metrics
-            eval_accuracies.append(eval_accuracy)
-            eval_true_positives.append(eval_tp)
-            eval_true_negatives.append(eval_tn)
-            eval_false_negatives.append(eval_fn)
-            eval_false_positives.append(eval_fp)
-            eval_total_trials.append(eval_trials)
-
-            # Calculate recent batch averages for comparison
-            recent_window = min(100, len(batch_rewards))
-            avg_batch_reward = np.mean(batch_rewards[-recent_window:]) if batch_rewards else 0.0
-            avg_loss = np.mean(batch_losses[-recent_window:]) if batch_losses else 0.0
 
             # Print combined progress and evaluation
             tqdm.tqdm.write(f"Frames {frames_collected:7d}/{total_frames} | "
-                            f"Accuracy: {eval_accuracy:7.4f} | "
-                            f"Total Reward: {eval_total_reward:7.2f} | "
-                            f"Trials: {eval_trials:3d} | "
-                            f"TP: {eval_tp:3d} | "
-                            f"TN: {eval_tn:3d} | "
-                            f"FN: {eval_fn:3d} | "
-                            f"FP: {eval_fp:3d} | "
+                            f"Eval Reward: {eval_reward:7.2f} ± {eval_reward_std:5.2f} | "
                             f"Loss: {avg_loss:6.4f} | "
                             f"ε: {current_epsilon:.3f}")
 
+            # Reset recent losses and update last eval frame
+            recent_losses = []
+            last_eval_frame = frames_collected
+
             # Check if this is the best eval performance
-            if eval_accuracy > best_accuracy:
-                best_accuracy = eval_accuracy
+            if eval_reward > best_reward:
+                best_reward = eval_reward
 
                 # Save as best model
                 exp_manager.save_model(
@@ -496,17 +475,11 @@ def train_neurogym(args):
                     checkpoint_name="best_model.pt",
                     metadata={
                         'frames': int(frames_collected),
-                        'eval_accuracy': float(eval_accuracy),
-                        'eval_total_reward': float(eval_total_reward),
-                        'eval_trials': int(eval_trials),
-                        'eval_true_positives': int(eval_tp),
-                        'eval_true_negatives': int(eval_tn),
-                        'eval_false_negatives': int(eval_fn),
-                        'eval_false_positives': int(eval_fp),
+                        'eval_reward': float(eval_reward),
                         'epsilon': float(current_epsilon),
                     }
                 )
-                tqdm.tqdm.write(f"  → New best model! Accuracy: {eval_accuracy:.4f}")
+                tqdm.tqdm.write(f"  → New best model! Reward: {eval_reward:.2f}")
 
         # Checkpoint every N frames
         if frames_collected % args.checkpoint_freq == 0 and frames_collected > 0:
@@ -526,14 +499,14 @@ def train_neurogym(args):
     pbar.close()
 
     # Save final model
-    final_avg_reward = float(np.mean(batch_rewards[-100:])) if len(batch_rewards) >= 100 else 0.0
+    final_eval_reward = eval_rewards[-1] if eval_rewards else 0.0
     exp_manager.save_model(
         policy,
         optimizer=optimizer,
         checkpoint_name="final_model.pt",
         metadata={
             'frames': int(frames_collected),
-            'avg_reward': float(final_avg_reward),
+            'final_eval_reward': float(final_eval_reward),
         }
     )
 
@@ -541,31 +514,22 @@ def train_neurogym(args):
     import json
     metrics_path = exp_manager.exp_dir / "training_metrics.json"
     metrics = {
-        'eval_accuracies': eval_accuracies,
-        'eval_true_positives': eval_true_positives,
-        'eval_true_negatives': eval_true_negatives,
-        'eval_false_negatives': eval_false_negatives,
-        'eval_false_positives': eval_false_positives,
-        'eval_total_trials': eval_total_trials,
-        'batch_rewards': batch_rewards,
-        'batch_losses': batch_losses,
+        'eval_rewards': eval_rewards,
+        'eval_reward_stds': eval_reward_stds,
+        'eval_losses': eval_losses,
     }
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"Saved training metrics to {metrics_path}")
 
+    # Close environments
     env.close()
+    eval_env.close()
     print("\n" + "="*60)
     print("Training completed!")
     print(f"Total frames: {frames_collected}")
-    if eval_accuracies:
-        print(f"Best eval accuracy: {best_accuracy:.4f}")
-        print(f"Final eval accuracy: {eval_accuracies[-1]:.4f}")
-        print(f"Final eval trials: {eval_total_trials[-1]}")
-        print(f"Final eval false negatives: {eval_false_negatives[-1]}")
-        print(f"Final eval false positives: {eval_false_positives[-1]}")
-    else:
-        print(f"Final batch avg reward: {final_avg_reward:.2f}")
+    print(f"Best eval reward: {best_reward:.2f}")
+    print(f"Final eval reward: {final_eval_reward:.2f}")
     print(f"Results saved to: {exp_manager.exp_dir}")
     print("="*60)
 
@@ -795,8 +759,8 @@ def main():
     train_parser.add_argument('--max-episode-steps', type=int, default=500, help='Maximum steps per episode')
     train_parser.add_argument('--total-frames', type=int, default=50000, help='Total number of training frames')
     train_parser.add_argument('--model-type', type=str, default='mpn',
-                             choices=['mpn', 'mpn-frozen', 'rnn'],
-                             help='Model type: mpn, mpn-frozen (no plasticity), rnn')
+                             choices=['mpn', 'mpn-frozen', 'rnn', 'lstm'],
+                             help='Model type: mpn, mpn-frozen (no plasticity), rnn, lstm')
     train_parser.add_argument('--hidden-dim', type=int, default=64, help='Hidden dimension')
     train_parser.add_argument('--num-layers', type=int, default=1, help='Number of recurrent layers')
     train_parser.add_argument('--eta', type=float, default=0.1, help='Hebbian learning rate (MPN only)')
@@ -815,7 +779,9 @@ def main():
     train_parser.add_argument('--target-update-tau', type=float, default=0.95, help='Target network soft update tau')
     train_parser.add_argument('--checkpoint-freq', type=int, default=5000, help='Checkpoint frequency (frames)')
     train_parser.add_argument('--print-freq', type=int, default=500, help='Print and evaluation frequency (frames)')
-    train_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu')
+    train_parser.add_argument('--num-eval-episodes', type=int, default=3, help='Number of evaluation episodes to average')
+    train_parser.add_argument('--num-envs', type=int, default=1, help='Number of parallel training environments')
+    train_parser.add_argument('--device', type=str, default='cpu', help='Device: gpu or cpu')
 
     # Eval command
     eval_parser = subparsers.add_parser('eval', help='Evaluate trained agent')
@@ -823,7 +789,7 @@ def main():
     eval_parser.add_argument('--num-eval-episodes', type=int, default=10, help='Number of evaluation episodes')
     eval_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load (default: best_model.pt)')
     eval_parser.add_argument('--max-episode-steps', type=int, default=500, help='Maximum steps per episode')
-    eval_parser.add_argument('--device', type=str, default='auto', help='Device: auto, cuda, cpu')
+    eval_parser.add_argument('--device', type=str, default='cpu', help='Device: gpu or cpu')
 
     # Render command
     render_parser = subparsers.add_parser('render', help='Render episode to plot')

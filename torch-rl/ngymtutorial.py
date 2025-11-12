@@ -1,4 +1,6 @@
 import multiprocessing
+import os
+import sys
 import time
 
 import imageio
@@ -17,11 +19,11 @@ from torchrl.envs import (Compose, ExplorationType, GrayScale, InitTracker,
                           ObservationNorm, Resize, RewardScaling, StepCounter,
                           ToTensorImage, TransformedEnv, set_exploration_type)
 from torchrl.envs.libs.gym import GymEnv
-from torchrl.modules import (MLP, ConvNet, EGreedyModule, QValueModule)
-import sys
+from torchrl.modules import MLP, ConvNet, EGreedyModule, QValueModule
+
 sys.path.append('/home/eulerfrog/KAM/mpn-rl')
-from rnn_module import RNNModule
 from torchrl.objectives import DQNLoss, SoftUpdate
+from torchrl.modules import LSTMModule
 
 TOTAL_FRAMES = 10_000
 global exit
@@ -50,7 +52,7 @@ print(device)
 
 # transforms environment so that only pixels are shown
 env = TransformedEnv(
-    GymEnv("GoNogo-v0", device=device),
+    GymEnv("DelayMatchSample-v0", device=device),
     Compose(
         StepCounter(),
         InitTracker(),
@@ -64,9 +66,9 @@ n_cells = env.reset()["observation"].shape[0]
 
 print(env.reset()["observation"].shape[0])
 
-# RNN takes input from observation and outputs to embed layer
-# RNN is simpler than LSTM - it only has one hidden state (not hidden + cell state)
-rnn = RNNModule(
+# LSTM takes input from observation and outputs to embed layer
+# LSTM has two hidden states: hidden state (h) and cell state (c)
+lstm = LSTMModule(
     input_size=n_cells,
     hidden_size=64,
     device=device,
@@ -74,14 +76,14 @@ rnn = RNNModule(
     out_key="embed",
 )
 
-# print("in_keys", rnn.in_keys)
-# print("out_keys", rnn.out_keys)
+# print("in_keys", lstm.in_keys)
+# print("out_keys", lstm.out_keys)
 
-env.append_transform(rnn.make_tensordict_primer())
+env.append_transform(lstm.make_tensordict_primer())
 
 
 mlp = MLP(
-    out_features=2,
+    out_features=3,
     num_cells=[
         64,
     ],
@@ -95,7 +97,7 @@ mlp = Mod(mlp, in_keys=["embed"], out_keys=["action_value"])
 qval = QValueModule(spec=env.action_spec)
 
 
-stoch_policy = Seq(rnn, mlp, qval)
+stoch_policy = Seq(lstm, mlp, qval)
 
 exploration_module = EGreedyModule(
     annealing_num_steps=1_000_000, spec=env.action_spec, eps_init=0.2
@@ -106,7 +108,7 @@ stoch_policy = Seq(
     exploration_module,
 )
 
-policy = Seq(rnn, mlp, qval)
+policy = Seq(lstm, mlp, qval)
 
 policy(env.reset())
 
@@ -189,7 +191,7 @@ listener.stop()
 
 sample_trajectory = sample_trajectory.cpu()
 
-labels = ["fixation","nogo","go","action"]
+labels = ["fixation","mod1","mod2","action"]
 plt.rcParams['font.family'] = 'serif'  # or 'sans-serif', 'monospace', etc.
 
 fig, axs = plt.subplots(2,1)
@@ -203,11 +205,17 @@ for i in range(4):
 axs[1].plot(sample_trajectory[:length, 4])
 axs[1].set_title("Reward")
 axs[0].legend()
-plt.show()
 
-print(misses)
+# Save plots to the parent directory (mpn-rl root)
+output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+trajectory_path = os.path.join(output_dir, 'lstm_ngym_trajectory.png')
+plt.savefig(trajectory_path)
+plt.close()
 
-fig, axs = plt.subplots(3,1)
+print(f"Saved trajectory plot to {trajectory_path}")
+print(f"Misses: {misses}")
+
+fig, axs = plt.subplots(3,1, figsize=(10, 8))
 
 axs[0].plot(loss)
 axs[0].set_title("Loss")
@@ -215,4 +223,11 @@ axs[1].plot(reward)
 axs[1].set_title("Reward")
 axs[2].plot(misses)
 axs[2].set_title("Misses")
-plt.show()
+plt.tight_layout()
+
+training_path = os.path.join(output_dir, 'lstm_ngym_training.png')
+plt.savefig(training_path)
+plt.close()
+
+print(f"Saved training plots to {training_path}")
+print("\nLSTM training completed successfully!")
