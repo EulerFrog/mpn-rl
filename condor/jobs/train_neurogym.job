@@ -1,0 +1,21 @@
+universe = vanilla
+executable = ./condor/scripts/train_neurogym.sh
+
+# Resource requests (GPU training)
+request_cpus = 2
+request_gpus = 1
+request_memory = 8GB
+
+# Output files (organized in condor/logs)
+output = condor/logs/neurogym_$(Process).out
+error  = condor/logs/neurogym_$(Process).err
+log    = condor/logs/neurogym_$(Process).log
+
++CSCI_GrpDesktop = true
+
+max_materialize = 50
+
+# Pass arguments from args file
+# Format: ENV_NAME MODEL_TYPE HIDDEN_DIM TOTAL_FRAMES
+arguments = $(args)
+Queue args from condor/args/train_neurogym_args.txt

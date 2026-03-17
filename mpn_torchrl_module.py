@@ -50,6 +50,7 @@ from torchrl.data.tensor_specs import Unbounded
 from torchrl.envs.transforms import TensorDictPrimer
 
 from mpn_module import MPNLayer
+from mpn_poly_module import MPNPolyLayer
 
 
 class MPNModule(ModuleBase):
@@ -60,43 +61,20 @@ class MPNModule(ModuleBase):
     TensorDict-based infrastructure. It maintains a recurrent state (M matrix) that
     persists across time steps within an episode.
 
+    Optionally includes pre-MPN linear layers that project the input through
+    a sequence of Linear + tanh layers before the MPN layer.
+
     Args:
         input_size: Dimension of input features
         hidden_size: Dimension of hidden layer (output)
-        eta: Learning rate for Hebbian plasticity (default: 0.01)
-        lambda_decay: Decay factor for M matrix (default: 0.95)
         activation: Activation function ('relu', 'tanh', 'sigmoid', 'linear')
         bias: Whether to use bias term (default: True)
         freeze_plasticity: Disable Hebbian updates (default: False)
+        lambda_max: Maximum value for lambda clamping (default 0.99)
+        num_pre_layers: Number of Linear+tanh layers before MPN (default: 0)
         in_key: Input key in TensorDict (default: "observation")
         out_key: Output key in TensorDict (default: "embed")
         device: Device to place module on (default: None)
-
-    Input Keys:
-        - in_key: Input observations
-        - (in_key + "_recurrent_state_m"): M matrix state (auto-initialized if missing)
-        - "is_init": Flag indicating episode start (automatically added)
-
-    Output Keys:
-        - out_key: Hidden activations
-        - ("next", in_key + "_recurrent_state_m"): Updated M matrix
-
-    Example:
-        >>> mpn = MPNModule(
-        ...     input_size=4,
-        ...     hidden_size=64,
-        ...     in_key="observation",
-        ...     out_key="embed"
-        ... )
-        >>>
-        >>> # Create sample tensordict
-        >>> td = TensorDict({
-        ...     "observation": torch.randn(32, 4)
-        ... }, batch_size=[32])
-        >>>
-        >>> # Forward pass (automatically initializes state)
-        >>> td = mpn(td)
-        >>> print(td.keys())  # ['observation', 'embed', ('next', 'observation_recurrent_state_m')]
     """
 
     DEFAULT_IN_KEYS = ["recurrent_state_m"]
@@ -106,11 +84,11 @@ class MPNModule(ModuleBase):
         self,
         input_size: int,
         hidden_size: int,
-        eta: float = 0.01,
-        lambda_decay: float = 0.95,
         activation: str = 'tanh',
         bias: bool = True,
         freeze_plasticity: bool = False,
+        lambda_max: float = 0.99,
+        num_pre_layers: int = 0,
         in_key: Optional[str] = None,
         in_keys: Optional[list] = None,
         out_key: Optional[str] = None,
@@ -173,29 +151,50 @@ class MPNModule(ModuleBase):
 
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.eta = eta
-        self.lambda_decay = lambda_decay
         self.activation = activation
         self.freeze_plasticity = freeze_plasticity
 
-        # Create MPN layer
+        # Build pre-MPN linear layers: Linear + tanh
+        self.pre_layers = nn.ModuleList()
+        pre_input_dim = input_size
+        for _ in range(num_pre_layers):
+            self.pre_layers.append(nn.Linear(pre_input_dim, hidden_size))
+            pre_input_dim = hidden_size
+
+        # The MPN layer input_dim is hidden_size if we have pre-layers, else input_size
+        mpn_input_dim = hidden_size if num_pre_layers > 0 else input_size
+
+        # Create MPN layer (eta and lambda are trainable parameters internally)
         self.mpn_layer = MPNLayer(
-            input_dim=input_size,
+            input_dim=mpn_input_dim,
             hidden_dim=hidden_size,
-            eta=eta,
-            lambda_decay=lambda_decay,
             activation=activation,
             bias=bias,
-            freeze_plasticity=freeze_plasticity
+            freeze_plasticity=freeze_plasticity,
+            lambda_max=lambda_max,
         )
+
+        # Store the actual MPN input dim for state shape
+        self._mpn_input_dim = mpn_input_dim
 
         if device is not None:
             self.to(device)
+
+    @property
+    def recurrent_mode(self):
+        rm = recurrent_mode()
+        if rm is None:
+            return bool(self._default_recurrent_mode)
+        return rm
 
     @dispatch
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         """
         Forward pass through the MPN layer using TensorDict.
+
+        Mirrors TorchRL's LSTMModule pattern exactly:
+        - Non-recurrent mode (rollout): reshape to [batch, 1, features], single step.
+        - Recurrent mode (training): keep [batch, T, features], full sequence with BPTT.
 
         Args:
             tensordict: Input TensorDict containing observations and optionally
@@ -205,54 +204,82 @@ class MPNModule(ModuleBase):
             Updated TensorDict with hidden activations and new recurrent state
         """
         from tensordict.utils import expand_as_right
+        from torchrl.objectives.value.functional import (
+            _inv_pad_sequence,
+            _split_and_pad_sequence,
+        )
 
-        # Extract values - same pattern as LSTM
-        defaults = [NO_DEFAULT, None]  # observation is required, state is optional
+        defaults = [NO_DEFAULT, None]
         shape = tensordict.shape
         tensordict_shaped = tensordict
 
-        # Reshape to [batch, steps, features] format (non-recurrent mode)
-        # This matches LSTM's approach at line 703
-        tensordict_shaped = tensordict.reshape(-1).unsqueeze(-1)
+        if self.recurrent_mode:
+            # Ensure at least 3 dims: [batch, time, feature]
+            ndim = tensordict_shaped.get(self.in_keys[0]).ndim
+            while ndim < 3:
+                tensordict_shaped = tensordict_shaped.unsqueeze(0)
+                ndim += 1
+            if ndim > 3:
+                dims_to_flatten = ndim - 3
+                nelts = prod(tensordict_shaped.shape[: dims_to_flatten + 1])
+                tensordict_shaped = tensordict_shaped.apply(
+                    lambda value: value.flatten(0, dims_to_flatten),
+                    batch_size=[nelts, tensordict_shaped.shape[-1]],
+                )
+        else:
+            tensordict_shaped = tensordict.reshape(-1).unsqueeze(-1)
+
+        is_init = tensordict_shaped.get("is_init", None)
+        if is_init is not None:
+            is_init = is_init.squeeze(-1)
+
+        # Handle episode boundaries within a sequence (multi-trajectory batches)
+        splits = None
+        if self.recurrent_mode and is_init is not None and is_init[..., 1:].any():
+            from torchrl.objectives.value.utils import _get_num_per_traj_init
+            splits = _get_num_per_traj_init(is_init)
+            tensordict_shaped_shape = tensordict_shaped.shape
+            tensordict_shaped = _split_and_pad_sequence(
+                tensordict_shaped.select(*self.in_keys, strict=False), splits
+            )
+            is_init = tensordict_shaped.get("is_init", None)
+            if is_init is not None:
+                is_init = is_init.squeeze(-1)
 
         value, recurrent_state_m = (
             tensordict_shaped.get(key, default)
             for key, default in zip(self.in_keys[:2], defaults)
         )
-        is_init = tensordict_shaped.get("is_init", None)
 
-        # Get batch and steps from value shape [batch, steps, features]
         batch, steps = value.shape[:2]
         device = value.device
         dtype = value.dtype
 
-        # Initialize or validate recurrent state
-        # State should be [batch, steps, hidden_size, input_size]
-        if recurrent_state_m is None:
-            # Initialize with shape [batch, steps, hidden_size, input_size]
-            recurrent_state_m = torch.zeros(
-                batch, steps,
-                self.hidden_size, self.input_size,
-                device=device, dtype=dtype
-            )
-
-        # Reset state where is_init is True (same pattern as LSTM line 733-736)
-        if recurrent_state_m is not None and is_init is not None:
-            is_init_expand = expand_as_right(is_init.squeeze(-1), recurrent_state_m)
+        # In non-recurrent mode, reset state at episode boundaries (mirrors LSTM line 734-741)
+        if not self.recurrent_mode and recurrent_state_m is not None and is_init is not None:
+            is_init_expand = expand_as_right(is_init, recurrent_state_m)
             recurrent_state_m = torch.where(is_init_expand, 0, recurrent_state_m)
 
-        # Call internal MPN forward
         val, new_state_m = self._mpn(value, batch, steps, device, dtype, recurrent_state_m)
 
-        # Set outputs
         tensordict_shaped.set(self.out_keys[0], val)
         tensordict_shaped.set(self.out_keys[1], new_state_m)
 
-        # Reshape back to original shape
+        if splits is not None:
+            tensordict_shaped = _inv_pad_sequence(tensordict_shaped, splits).reshape(
+                tensordict_shaped_shape
+            )
+
         if shape != tensordict_shaped.shape or tensordict_shaped is not tensordict:
             tensordict.update(tensordict_shaped.reshape(shape))
 
         return tensordict
+
+    def _apply_pre_layers(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply pre-MPN linear layers with tanh activation."""
+        for linear in self.pre_layers:
+            x = torch.tanh(linear(x))
+        return x
 
     def _mpn(
         self,
@@ -264,7 +291,12 @@ class MPNModule(ModuleBase):
         state_m_in: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Internal MPN forward - matches LSTM._lstm pattern.
+        Internal MPN forward - mirrors LSTM._lstm pattern exactly.
+
+        In non-recurrent mode (rollout): steps == 1, processes a single step.
+        In recurrent mode (training): steps == T, unrolls full sequence with BPTT.
+        Gradients flow through the Hebbian M update chain, enabling eta and lambda
+        to receive meaningful gradient signals during sequence training.
 
         Args:
             input: [batch, steps, input_size]
@@ -272,61 +304,57 @@ class MPNModule(ModuleBase):
             steps: number of time steps in the sequence
             device: device
             dtype: data type
-            state_m_in: [batch, steps, hidden_size, input_size] or None
+            state_m_in: [batch, steps, hidden_size, mpn_input_dim] or None
 
         Returns:
             output: [batch, steps, hidden_size]
-            state_m_out: [batch, steps, hidden_size, input_size]
+            state_m_out: [batch, steps, hidden_size, mpn_input_dim]
+                Zero-padded at positions 0..T-2; actual final M at position T-1.
+                (Mirrors LSTM convention — only state[:, 0] is used as starting
+                state when replaying the next sequence segment.)
         """
+        if not self.recurrent_mode and steps != 1:
+            raise ValueError(
+                f"MPNModule expects steps=1 in non-recurrent mode, got steps={steps}. "
+                "Use set_recurrent_mode(True) during training with sequence replay."
+            )
+
         # Initialize state if not provided
         if state_m_in is None:
             state_m_in = torch.zeros(
                 batch, steps,
-                self.hidden_size, self.input_size,
+                self.hidden_size, self._mpn_input_dim,
                 device=device, dtype=dtype
             )
 
-        # Extract initial state (first timestep)
-        # This matches LSTM pattern at line 791-792
-        _state_m = state_m_in[:, 0]  # [batch, hidden_size, input_size]
+        # Only the first step's stored state is used as the starting point.
+        # In recurrent mode, M_1..M_T are recomputed in this forward pass,
+        # giving gradients a path back to eta and lambda via BPTT.
+        _state_m = state_m_in[:, 0]  # [batch, hidden_size, mpn_input_dim]
 
-        # When plasticity is frozen, state is always zero (optimization)
         if self.freeze_plasticity:
-            # Process all steps without updating state (it stays zero)
             outputs = []
             for t in range(steps):
-                _input_t = input[:, t]
-                hidden_t, _ = self.mpn_layer(_input_t, _state_m)  # state is ignored
+                _input_t = self._apply_pre_layers(input[:, t])
+                hidden_t, _ = self.mpn_layer(_input_t, _state_m)
                 outputs.append(hidden_t)
 
-            # Stack outputs
             output = torch.stack(outputs, dim=1)
-
-            # Return all-zero state (detached for memory efficiency)
             state_m_out = torch.zeros(
-                batch, steps, self.hidden_size, self.input_size,
+                batch, steps, self.hidden_size, self._mpn_input_dim,
                 device=device, dtype=dtype
             ).detach()
         else:
-            # Process sequence step by step
-            # MPN must process sequentially to maintain Hebbian plasticity updates across time
             outputs = []
-
             for t in range(steps):
-                # Get input at timestep t: [batch, input_size]
-                _input_t = input[:, t]
-
-                # Forward through MPN layer
+                _input_t = self._apply_pre_layers(input[:, t])
                 hidden_t, _state_m = self.mpn_layer(_input_t, _state_m)
-
-                # Collect output: [batch, hidden_size]
                 outputs.append(hidden_t)
 
-            # Stack outputs: [batch, steps, hidden_size]
             output = torch.stack(outputs, dim=1)
 
-            # Pad state_m to match TorchRL format: [batch, steps, hidden_size, input_size]
-            # Following LSTM pattern at line 803-808: zeros for all steps except last
+            # Zero-pad intermediate positions — mirrors LSTM convention.
+            # The stored final state is used as state[:, 0] for the next segment.
             state_m_out = torch.stack(
                 [torch.zeros_like(_state_m) for _ in range(steps - 1)] + [_state_m],
                 dim=1
@@ -343,10 +371,6 @@ class MPNModule(ModuleBase):
 
         Returns:
             TensorDictPrimer that initializes recurrent states
-
-        Example:
-            >>> mpn = MPNModule(input_size=4, hidden_size=64)
-            >>> env.append_transform(mpn.make_tensordict_primer())
         """
         def make_tuple(key):
             if isinstance(key, tuple):
@@ -363,10 +387,236 @@ class MPNModule(ModuleBase):
                 f"in_keys={self.in_keys} and out_keys={self.out_keys} instead."
             )
 
-        # Create primer with M matrix spec
+        # Create primer with M matrix spec — uses mpn_input_dim (after pre-layers)
         return TensorDictPrimer(
             {
-                in_key: Unbounded(shape=(self.hidden_size, self.input_size)),
+                in_key: Unbounded(shape=(self.hidden_size, self._mpn_input_dim)),
+            },
+            expand_specs=True,
+        )
+
+
+class MPNPolyModule(ModuleBase):
+    """
+    TorchRL-compatible MPN module with cubic M-matrix update.
+
+    Uses MPNPolyLayer internally:
+        M_t = -λ*(M_{t-1}⊙(M_{t-1}-|a|)⊙(M_{t-1}-|b|)) + η*h_t⊗x_t^T
+
+    where λ, a, b, η are trainable scalar parameters.  Same interface as MPNModule.
+
+    Args:
+        input_size: Dimension of input features
+        hidden_size: Dimension of hidden layer (output)
+        activation: Activation function ('relu', 'tanh', 'sigmoid', 'linear')
+        bias: Whether to use bias term (default: True)
+        freeze_plasticity: Disable Hebbian updates (default: False)
+        num_pre_layers: Number of Linear+tanh layers before MPN (default: 0)
+        in_key: Input key in TensorDict (default: "observation")
+        out_key: Output key in TensorDict (default: "embed")
+        device: Device to place module on (default: None)
+    """
+
+    DEFAULT_IN_KEYS = ["recurrent_state_m"]
+    DEFAULT_OUT_KEYS = [("next", "recurrent_state_m")]
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        activation: str = 'tanh',
+        bias: bool = True,
+        freeze_plasticity: bool = False,
+        num_pre_layers: int = 0,
+        in_key: Optional[str] = None,
+        in_keys: Optional[list] = None,
+        out_key: Optional[str] = None,
+        out_keys: Optional[list] = None,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+
+        if not ((in_key is None) ^ (in_keys is None)):
+            if in_key is None and in_keys is None:
+                in_key = "observation"
+                in_keys = [in_key, *self.DEFAULT_IN_KEYS]
+            else:
+                raise ValueError(
+                    f"Either in_keys or in_key must be specified but not both. "
+                    f"Got in_keys={in_keys} and in_key={in_key}"
+                )
+        elif in_key:
+            in_keys = [in_key, *self.DEFAULT_IN_KEYS]
+
+        if not ((out_key is None) ^ (out_keys is None)):
+            if out_key is None and out_keys is None:
+                out_key = "embed"
+                out_keys = [out_key, *self.DEFAULT_OUT_KEYS]
+            else:
+                raise ValueError(
+                    f"Either out_keys or out_key must be specified but not both. "
+                    f"Got out_keys={out_keys} and out_key={out_key}"
+                )
+        elif out_key:
+            out_keys = [out_key, *self.DEFAULT_OUT_KEYS]
+
+        in_keys = unravel_key_list(in_keys)
+        out_keys = unravel_key_list(out_keys)
+
+        if not isinstance(in_keys, (tuple, list)) or (
+            len(in_keys) != 2 and not (len(in_keys) == 3 and in_keys[-1] == "is_init")
+        ):
+            raise ValueError(
+                f"MPNPolyModule expects 2 inputs: a value and recurrent state "
+                f"(and potentially an 'is_init' marker). Got in_keys {in_keys} instead."
+            )
+        if not isinstance(out_keys, (tuple, list)) or len(out_keys) != 2:
+            raise ValueError(
+                f"MPNPolyModule expects 2 outputs: a value and recurrent state. "
+                f"Got out_keys {out_keys} instead."
+            )
+
+        if "is_init" not in in_keys:
+            in_keys = list(in_keys) + ["is_init"]
+
+        self.in_keys = in_keys
+        self.out_keys = out_keys
+
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.activation = activation
+        self.freeze_plasticity = freeze_plasticity
+
+        self.pre_layers = nn.ModuleList()
+        pre_input_dim = input_size
+        for _ in range(num_pre_layers):
+            self.pre_layers.append(nn.Linear(pre_input_dim, hidden_size))
+            pre_input_dim = hidden_size
+
+        mpn_input_dim = hidden_size if num_pre_layers > 0 else input_size
+
+        self.mpn_layer = MPNPolyLayer(
+            input_dim=mpn_input_dim,
+            hidden_dim=hidden_size,
+            activation=activation,
+            bias=bias,
+            freeze_plasticity=freeze_plasticity,
+        )
+
+        self._mpn_input_dim = mpn_input_dim
+
+        if device is not None:
+            self.to(device)
+
+    @dispatch
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        """Forward pass through the MPNPoly layer using TensorDict."""
+        from tensordict.utils import expand_as_right
+
+        defaults = [NO_DEFAULT, None]
+        shape = tensordict.shape
+        tensordict_shaped = tensordict.reshape(-1).unsqueeze(-1)
+
+        value, recurrent_state_m = (
+            tensordict_shaped.get(key, default)
+            for key, default in zip(self.in_keys[:2], defaults)
+        )
+        is_init = tensordict_shaped.get("is_init", None)
+
+        batch, steps = value.shape[:2]
+        device = value.device
+        dtype = value.dtype
+
+        if recurrent_state_m is None:
+            recurrent_state_m = torch.zeros(
+                batch, steps,
+                self.hidden_size, self._mpn_input_dim,
+                device=device, dtype=dtype
+            )
+
+        if recurrent_state_m is not None and is_init is not None:
+            is_init_expand = expand_as_right(is_init.squeeze(-1), recurrent_state_m)
+            recurrent_state_m = torch.where(is_init_expand, 0, recurrent_state_m)
+
+        val, new_state_m = self._mpn(value, batch, steps, device, dtype, recurrent_state_m)
+
+        tensordict_shaped.set(self.out_keys[0], val)
+        tensordict_shaped.set(self.out_keys[1], new_state_m)
+
+        if shape != tensordict_shaped.shape or tensordict_shaped is not tensordict:
+            tensordict.update(tensordict_shaped.reshape(shape))
+
+        return tensordict
+
+    def _apply_pre_layers(self, x: torch.Tensor) -> torch.Tensor:
+        for linear in self.pre_layers:
+            x = torch.tanh(linear(x))
+        return x
+
+    def _mpn(
+        self,
+        input: torch.Tensor,
+        batch: int,
+        steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        state_m_in: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if state_m_in is None:
+            state_m_in = torch.zeros(
+                batch, steps,
+                self.hidden_size, self._mpn_input_dim,
+                device=device, dtype=dtype
+            )
+
+        _state_m = state_m_in[:, 0]
+
+        if self.freeze_plasticity:
+            outputs = []
+            for t in range(steps):
+                _input_t = self._apply_pre_layers(input[:, t])
+                hidden_t, _ = self.mpn_layer(_input_t, _state_m)
+                outputs.append(hidden_t)
+
+            output = torch.stack(outputs, dim=1)
+            state_m_out = torch.zeros(
+                batch, steps, self.hidden_size, self._mpn_input_dim,
+                device=device, dtype=dtype
+            ).detach()
+        else:
+            outputs = []
+            for t in range(steps):
+                _input_t = self._apply_pre_layers(input[:, t])
+                hidden_t, _state_m = self.mpn_layer(_input_t, _state_m)
+                outputs.append(hidden_t)
+
+            output = torch.stack(outputs, dim=1)
+            state_m_out = torch.stack(
+                [torch.zeros_like(_state_m) for _ in range(steps - 1)] + [_state_m],
+                dim=1
+            )
+
+        return output, state_m_out
+
+    def make_tensordict_primer(self) -> TensorDictPrimer:
+        """Create a TensorDictPrimer for automatic state initialization."""
+        def make_tuple(key):
+            if isinstance(key, tuple):
+                return key
+            return (key,)
+
+        out_key = make_tuple(self.out_keys[1])
+        in_key = make_tuple(self.in_keys[1])
+        if out_key != ("next", *in_key):
+            raise RuntimeError(
+                "make_tensordict_primer is supposed to work with in_keys/out_keys that "
+                "have compatible names, ie. the out_keys should be named after ('next', <in_key>). Got "
+                f"in_keys={self.in_keys} and out_keys={self.out_keys} instead."
+            )
+
+        return TensorDictPrimer(
+            {
+                in_key: Unbounded(shape=(self.hidden_size, self._mpn_input_dim)),
             },
             expand_specs=True,
         )
@@ -383,8 +633,6 @@ if __name__ == "__main__":
     mpn = MPNModule(
         input_size=4,
         hidden_size=8,
-        eta=0.1,
-        lambda_decay=0.9,
         in_key="observation",
         out_key="embed"
     )
@@ -498,3 +746,34 @@ if __name__ == "__main__":
             td_sim["is_init"] = torch.zeros(batch_size, dtype=torch.bool)
 
     print("\nMPNModule tests completed successfully!")
+
+    # Test MPNPolyModule
+    print("\n" + "="*50)
+    print("Test 6: MPNPolyModule (polynomial update)")
+    print("="*50)
+
+    mpn_poly = MPNPolyModule(
+        input_size=4,
+        hidden_size=8,
+        in_key="observation",
+        out_key="embed"
+    )
+
+    td_poly = TensorDict({
+        "observation": torch.randn(3, 4),
+        "is_init": torch.tensor([True, False, True])
+    }, batch_size=[3])
+
+    td_poly = mpn_poly(td_poly)
+    print(f"Output keys: {list(td_poly.keys())}")
+    print(f"Hidden shape: {td_poly['embed'].shape}")
+    print(f"State shape: {td_poly['next', 'recurrent_state_m'].shape}")
+    print(f"lam (init): {mpn_poly.mpn_layer.lam.item():.4f}")
+    print(f"a   (init): {mpn_poly.mpn_layer.a.item():.4f}")
+    print(f"b   (init): {mpn_poly.mpn_layer.b.item():.4f}")
+    print(f"eta (init): {mpn_poly.mpn_layer.eta.item():.4f}")
+
+    primer_poly = mpn_poly.make_tensordict_primer()
+    print(f"Primer keys: {list(primer_poly.primers.keys())}")
+
+    print("\nMPNPolyModule test completed!")

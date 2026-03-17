@@ -39,11 +39,12 @@ ENV/
 
 # Experiments and outputs (generated data, not tracked)
 experiments/
+results/
+images/
 *.pt
 *.pth
 *.gif
 *.png
-!ai_docs/**/*.png
 
 # Data
 data/
@@ -56,6 +57,7 @@ logs/
 .condor_logs/
 condor/logs/
 condor/outputs/
+
 
 # OS
 .DS_Store
@@ -70,3 +72,6 @@ test_*.png
 dummy_*.result.txt
 
 .claude
+condor
+*.zip
+.env

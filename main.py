@@ -11,7 +11,7 @@ Examples:
     python main.py train-neurogym --env-name GoNogo-v0
 
     # Train with custom hyperparameters
-    python main.py train-neurogym --experiment-name my-agent --num-episodes 1000 --eta 0.1
+    python main.py train-neurogym --experiment-name my-agent --total-frames 50000
 
     # Evaluate
     python main.py eval --experiment-name my-agent --num-eval-episodes 10
@@ -23,6 +23,7 @@ Examples:
 import argparse
 import math
 import sys
+import uuid
 from pathlib import Path
 
 # Matplotlib for rendering
@@ -31,6 +32,7 @@ import neurogym
 import numpy as np
 import torch
 import tqdm
+import wandb
 # TorchRL imports
 from tensordict.nn import TensorDictModule as Mod
 from tensordict.nn import TensorDictSequential as Seq
@@ -44,7 +46,9 @@ from torchrl.objectives import DQNLoss, SoftUpdate
 
 # Local imports
 from model_utils import ExperimentManager
-from mpn_torchrl_module import MPNModule
+from mpn_module import RandomInputProjection
+from mpn_torchrl_module import MPNModule, MPNPolyModule
+import temporal_order_env  # registers TemporalOrder-v0 / TemporalOrder10-v0 / TemporalOrder20-v0
 from neurogym_transform import NeuroGymInfoTransform
 from neurogym_wrapper import NeuroGymInfoWrapper
 from rnn_module import RNNModule
@@ -96,19 +100,22 @@ def get_device(device_str='cpu'):
     return device
 
 
-def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, activation, device):
+def create_model(env, model_type, hidden_dim, num_layers, activation, device, lambda_max=0.99, num_pre_layers=0, num_mlp_layers=1, random_proj_dim=0):
     """
     Create policy model with stacked recurrent layers.
 
     Args:
         env: Environment (for getting observation/action dimensions)
-        model_type: 'mpn', 'mpn-frozen', 'rnn', or 'lstm'
+        model_type: 'mpn', 'mpn-frozen', 'mpn-poly', 'rnn', or 'lstm'
         hidden_dim: Hidden layer dimension
         num_layers: Number of recurrent layers to stack
-        eta: Hebbian learning rate (MPN only)
-        lambda_decay: M matrix decay (MPN only)
         activation: Activation function
         device: Device to create model on
+        lambda_max: Maximum value for lambda clamping (MPN only, default 0.99)
+        num_pre_layers: Number of Linear+tanh layers before MPN (default 0)
+        random_proj_dim: If > 0, project observations through a fixed random
+            matrix (Xavier init) before any recurrent layer, per eLife-83035
+            Methods 5.1. 0 disables the projection. (default: 0)
 
     Returns:
         policy: The policy network (stacked recurrent layers -> mlp -> qval)
@@ -120,20 +127,33 @@ def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, act
     # Determine model configuration
     use_rnn = (model_type == 'rnn')
     use_lstm = (model_type == 'lstm')
+    use_mpn_poly = (model_type == 'mpn-poly')
     freeze_plasticity = (model_type == 'mpn-frozen')
 
-    # Create stacked recurrent layers
+    # Optional fixed random input projection (eLife-83035 Methods 5.1).
+    # Projects observations to a higher-dimensional space before any recurrent
+    # layer, so that near-zero inputs still produce a non-trivial response.
+    # W_rand and b_rand are Xavier-initialised and frozen during training.
     layers = []
+    if random_proj_dim > 0:
+        proj = RandomInputProjection(obs_dim, random_proj_dim).to(device)
+        proj_module = Mod(proj, in_keys=["observation"], out_keys=["observation_proj"])
+        layers.append(proj_module)
+        recurrent_in_key = "observation_proj"
+        effective_obs_dim = random_proj_dim
+    else:
+        recurrent_in_key = "observation"
+        effective_obs_dim = obs_dim
 
     if use_rnn:
         # RNN supports multiple layers natively
         recurrent_module = RNNModule(
-            input_size=obs_dim,
+            input_size=effective_obs_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             nonlinearity=activation,
             device=device,
-            in_key="observation",
+            in_key=recurrent_in_key,
             out_key=f"embed_{num_layers-1}",
         )
         layers.append(recurrent_module)
@@ -141,11 +161,11 @@ def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, act
     elif use_lstm:
         # LSTM supports multiple layers natively
         recurrent_module = LSTMModule(
-            input_size=obs_dim,
+            input_size=effective_obs_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             device=device,
-            in_key="observation",
+            in_key=recurrent_in_key,
             out_key=f"embed_{num_layers-1}",
         )
         layers.append(recurrent_module)
@@ -153,24 +173,39 @@ def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, act
     else:
         # Stack multiple MPN layers
         for layer_idx in range(num_layers):
-            in_key = "observation" if layer_idx == 0 else f"embed_{layer_idx-1}"
+            in_key = recurrent_in_key if layer_idx == 0 else f"embed_{layer_idx-1}"
             out_key = f"embed_{layer_idx}"
 
             # Recurrent state keys for this layer
             in_keys = [in_key, f"recurrent_state_{layer_idx}"]
             out_keys = [out_key, ("next", f"recurrent_state_{layer_idx}")]
 
-            mpn_layer = MPNModule(
-                input_size=obs_dim if layer_idx == 0 else hidden_dim,
-                hidden_size=hidden_dim,
-                eta=eta,
-                lambda_decay=lambda_decay,
-                activation=activation,
-                freeze_plasticity=freeze_plasticity,
-                device=device,
-                in_keys=in_keys,
-                out_keys=out_keys,
-            )
+            if use_mpn_poly:
+                common_kwargs = dict(
+                    input_size=effective_obs_dim if layer_idx == 0 else hidden_dim,
+                    hidden_size=hidden_dim,
+                    activation=activation,
+                    freeze_plasticity=freeze_plasticity,
+                    num_pre_layers=num_pre_layers if layer_idx == 0 else 0,
+                    device=device,
+                    in_keys=in_keys,
+                    out_keys=out_keys,
+                )
+                mpn_layer = MPNPolyModule(**common_kwargs)
+            else:
+                common_kwargs = dict(
+                    input_size=effective_obs_dim if layer_idx == 0 else hidden_dim,
+                    hidden_size=hidden_dim,
+                    activation=activation,
+                    freeze_plasticity=freeze_plasticity,
+                    lambda_max=lambda_max,
+                    num_pre_layers=num_pre_layers if layer_idx == 0 else 0,
+                    device=device,
+                    in_keys=in_keys,
+                    out_keys=out_keys,
+                )
+                mpn_layer = MPNModule(**common_kwargs)
+
             layers.append(mpn_layer)
             env.append_transform(mpn_layer.make_tensordict_primer())
 
@@ -180,7 +215,7 @@ def create_model(env, model_type, hidden_dim, num_layers, eta, lambda_decay, act
     # Create MLP head for Q-values (reads from final layer output)
     mlp = MLP(
         out_features=action_dim,
-        num_cells=[hidden_dim],
+        num_cells=[hidden_dim] * num_mlp_layers,
         device=device,
     )
     mlp[-1].bias.data.fill_(0.0)
@@ -241,15 +276,35 @@ def train_neurogym(args):
     print("Training with TorchRL on NeuroGym")
     print("="*60)
 
+    # Auto-generate experiment ID and append to experiment name
+    if args.experiment_id is None:
+        args.experiment_id = str(uuid.uuid4())[:8]
+    if args.experiment_name is not None:
+        args.experiment_name = f"{args.experiment_name}-{args.experiment_id}"
+
     # Create experiment manager
     exp_manager = ExperimentManager(args.experiment_name)
     print(f"Experiment: {exp_manager.experiment_name}")
+    print(f"Experiment ID: {args.experiment_id}")
+    if args.tag:
+        print(f"Tag: {args.tag}")
     print(f"Directory: {exp_manager.exp_dir}\n")
 
     # Save configuration
     config = vars(args)
     config['command'] = 'train-neurogym'
     exp_manager.save_config(config)
+
+    # Initialise Weights & Biases
+    if args.wandb:
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=exp_manager.experiment_name,
+            config=config,
+            tags=[args.tag] if args.tag else [],
+            dir=str(exp_manager.exp_dir),
+        )
 
     # Setup device
     device = get_device(args.device)
@@ -285,6 +340,7 @@ def train_neurogym(args):
     # Print model configuration
     use_rnn = (args.model_type == 'rnn')
     use_lstm = (args.model_type == 'lstm')
+    use_mpn_poly = (args.model_type == 'mpn-poly')
     freeze_plasticity = (args.model_type == 'mpn-frozen')
 
     print(f"Algorithm: DQN with TorchRL")
@@ -293,13 +349,26 @@ def train_neurogym(args):
     print(f"Observation dim: {obs_dim}, Action dim: {action_dim}")
     print(f"Max episode steps: {args.max_episode_steps}")
 
+    if args.random_proj_dim > 0:
+        print(f"Random input projection: {obs_dim} → {args.random_proj_dim} (Xavier init, fixed)")
+
     if use_rnn:
         print(f"RNN: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}, activation={args.activation}\n")
     elif use_lstm:
         print(f"LSTM: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}\n")
+    elif use_mpn_poly:
+        print(f"MPN-Poly: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}")
+        print(f"Activation: {args.activation}, Update: a*(M⊙M) + b*M + h⊗x^T (a,b trainable)")
+        if args.num_pre_layers > 0:
+            print(f"Pre-MPN layers: {args.num_pre_layers} x Linear+tanh")
+        print()
     else:
-        print(f"MPN: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}, eta={args.eta}, lambda={args.lambda_decay}")
-        print(f"Activation: {args.activation}, Plasticity frozen: {freeze_plasticity}\n")
+        print(f"MPN: hidden_dim={args.hidden_dim}, num_layers={args.num_layers}, lambda_max={args.lambda_max}")
+        print(f"Activation: {args.activation}, Plasticity frozen: {freeze_plasticity}")
+        print(f"Eta: trainable scalar (init=0.01), Lambda: trainable scalar (init=0.95)")
+        if args.num_pre_layers > 0:
+            print(f"Pre-MPN layers: {args.num_pre_layers} x Linear+tanh")
+        print()
 
     # Create policy model
     policy = create_model(
@@ -307,10 +376,11 @@ def train_neurogym(args):
         model_type=args.model_type,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
-        eta=args.eta,
-        lambda_decay=args.lambda_decay,
         activation=args.activation,
-        device=device
+        device=device,
+        lambda_max=args.lambda_max,
+        num_pre_layers=args.num_pre_layers,
+        random_proj_dim=args.random_proj_dim,
     )
 
     # Exploration module
@@ -342,7 +412,7 @@ def train_neurogym(args):
     updater = SoftUpdate(loss_fn, eps=args.target_update_tau)
 
     # Optimizer
-    optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # Data collector
     collector = SyncDataCollector(
@@ -460,6 +530,15 @@ def train_neurogym(args):
                             f"Loss: {avg_loss:6.4f} | "
                             f"ε: {current_epsilon:.3f}")
 
+            # Log to wandb
+            if args.wandb:
+                wandb.log({
+                    "eval/reward": eval_reward,
+                    "eval/reward_std": eval_reward_std,
+                    "train/loss": avg_loss,
+                    "train/epsilon": current_epsilon,
+                }, step=frames_collected)
+
             # Reset recent losses and update last eval frame
             recent_losses = []
             last_eval_frame = frames_collected
@@ -480,6 +559,8 @@ def train_neurogym(args):
                     }
                 )
                 tqdm.tqdm.write(f"  → New best model! Reward: {eval_reward:.2f}")
+                if args.wandb:
+                    wandb.log({"eval/best_reward": best_reward}, step=frames_collected)
 
         # Checkpoint every N frames
         if frames_collected % args.checkpoint_freq == 0 and frames_collected > 0:
@@ -494,6 +575,7 @@ def train_neurogym(args):
                 }
             )
             tqdm.tqdm.write(f"  → Checkpoint saved at {frames_collected} frames")
+            exp_manager.cleanup_checkpoints(args.max_checkpoints)
 
     # Close progress bar
     pbar.close()
@@ -521,6 +603,10 @@ def train_neurogym(args):
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"Saved training metrics to {metrics_path}")
+
+    # Finish wandb run
+    if args.wandb:
+        wandb.finish()
 
     # Close environments
     env.close()
@@ -570,10 +656,11 @@ def evaluate(args):
         model_type=config.get('model_type', 'mpn'),
         hidden_dim=config['hidden_dim'],
         num_layers=config.get('num_layers', 1),
-        eta=config.get('eta', 0.1),
-        lambda_decay=config.get('lambda_decay', 0.95),
         activation=config.get('activation', 'tanh'),
-        device=device
+        device=device,
+        lambda_max=config.get('lambda_max', 0.99),
+        num_pre_layers=config.get('num_pre_layers', 0),
+        random_proj_dim=config.get('random_proj_dim', 0),
     )
 
     # Load checkpoint
@@ -661,10 +748,11 @@ def render_to_plot(args):
         model_type=config.get('model_type', 'mpn'),
         hidden_dim=config['hidden_dim'],
         num_layers=config.get('num_layers', 1),
-        eta=config.get('eta', 0.1),
-        lambda_decay=config.get('lambda_decay', 0.95),
         activation=config.get('activation', 'tanh'),
-        device=device
+        device=device,
+        lambda_max=config.get('lambda_max', 0.99),
+        num_pre_layers=config.get('num_pre_layers', 0),
+        random_proj_dim=config.get('random_proj_dim', 0),
     )
 
     # Load checkpoint
@@ -759,12 +847,14 @@ def main():
     train_parser.add_argument('--max-episode-steps', type=int, default=500, help='Maximum steps per episode')
     train_parser.add_argument('--total-frames', type=int, default=50000, help='Total number of training frames')
     train_parser.add_argument('--model-type', type=str, default='mpn',
-                             choices=['mpn', 'mpn-frozen', 'rnn', 'lstm'],
-                             help='Model type: mpn, mpn-frozen (no plasticity), rnn, lstm')
+                             choices=['mpn', 'mpn-frozen', 'mpn-poly', 'rnn', 'lstm'],
+                             help='Model type: mpn, mpn-frozen (no plasticity), mpn-poly (polynomial update), rnn, lstm')
     train_parser.add_argument('--hidden-dim', type=int, default=64, help='Hidden dimension')
     train_parser.add_argument('--num-layers', type=int, default=1, help='Number of recurrent layers')
-    train_parser.add_argument('--eta', type=float, default=0.1, help='Hebbian learning rate (MPN only)')
-    train_parser.add_argument('--lambda-decay', type=float, default=0.95, help='M matrix decay (MPN only)')
+    train_parser.add_argument('--num-mlp-layers', type=int, default=1, help='Number of hidden layers in MLP head (default: 1)')
+    train_parser.add_argument('--num-pre-layers', type=int, default=0, help='Number of Linear+tanh layers before MPN (default: 0)')
+    train_parser.add_argument('--random-proj-dim', type=int, default=10, help='Project observations through a fixed random matrix (Xavier init) of this size before any recurrent layer, per eLife-83035 Methods 5.1. Set to 0 to disable. (default: 10)')
+    train_parser.add_argument('--lambda-max', type=float, default=0.99, help='Maximum value for lambda clamping (MPN only)')
     train_parser.add_argument('--activation', type=str, default='tanh',
                              choices=['relu', 'tanh', 'sigmoid'], help='Activation function')
     train_parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
@@ -775,13 +865,20 @@ def main():
     train_parser.add_argument('--batch-size', type=int, default=4, help='Training batch size')
     train_parser.add_argument('--utd', type=int, default=64, help='Updates-to-data ratio')
     train_parser.add_argument('--learning-rate', type=float, default=3e-4, help='Learning rate')
+    train_parser.add_argument('--weight-decay', type=float, default=0.0, help='L2 weight decay for Adam optimizer (default: 0.0)')
     train_parser.add_argument('--grad-clip', type=float, default=10.0, help='Gradient clipping')
     train_parser.add_argument('--target-update-tau', type=float, default=0.95, help='Target network soft update tau')
     train_parser.add_argument('--checkpoint-freq', type=int, default=5000, help='Checkpoint frequency (frames)')
+    train_parser.add_argument('--max-checkpoints', type=int, default=2, help='Max periodic checkpoints to keep (oldest deleted)')
     train_parser.add_argument('--print-freq', type=int, default=500, help='Print and evaluation frequency (frames)')
     train_parser.add_argument('--num-eval-episodes', type=int, default=3, help='Number of evaluation episodes to average')
     train_parser.add_argument('--num-envs', type=int, default=1, help='Number of parallel training environments')
     train_parser.add_argument('--device', type=str, default='cpu', help='Device: gpu or cpu')
+    train_parser.add_argument('--tag', type=str, default=None, help='Tag to group related experiments (e.g., wm-sweep-v1)')
+    train_parser.add_argument('--experiment-id', type=str, default=None, help='Unique experiment ID (auto-generated UUID if not provided)')
+    train_parser.add_argument('--wandb', action='store_true', default=False, help='Enable Weights & Biases logging')
+    train_parser.add_argument('--wandb-project', type=str, default='mpn-rl', help='W&B project name')
+    train_parser.add_argument('--wandb-entity', type=str, default=None, help='W&B entity (team/username)')
 
     # Eval command
     eval_parser = subparsers.add_parser('eval', help='Evaluate trained agent')

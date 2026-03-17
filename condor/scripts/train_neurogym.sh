@@ -1,36 +1,37 @@
 #!/bin/bash
 
-# HTCondor training script for GoNogo neurogym task
-# Usage: ./train_gonogo.sh MODEL_TYPE ETA LAMBDA HIDDEN_DIM NUM_LAYERS TOTAL_FRAMES MAX_EPISODE_STEPS LEARNING_RATE SUFFIX
+# HTCondor training script for NeuroGym environments
+# Usage: ./train_neurogym.sh ENV_NAME MODEL_TYPE HIDDEN_DIM TOTAL_FRAMES
 
 set -e  # Exit on error
 
 # Parse arguments
-MODEL_TYPE=$1   # mpn, mpn-frozen, rnn, or lstm
-ETA=$2
-LAMBDA=$3
-HIDDEN_DIM=$4
-NUM_LAYERS=$5
-TOTAL_FRAMES=$6
-MAX_EPISODE_STEPS=$7
-LEARNING_RATE=$8
-SUFFIX=$9    # suffix (e.g., "spicy_layer1")
+ENV_NAME=$1      # e.g., GoNogo-v0, PerceptualDecisionMaking-v0
+MODEL_TYPE=$2    # mpn, mpn-frozen, or mpn-poly
+HIDDEN_DIM=$3    # e.g., 128
+TOTAL_FRAMES=$4  # e.g., 50000
 
-# Generate experiment name: gonogo-model-verb-noun
-EXP_NAME="gonogo-${MODEL_TYPE}-${SUFFIX}"
+# Fixed parameters
+NUM_LAYERS=1
+LEARNING_RATE=0.001
+MAX_EPISODE_STEPS=1000
+
+# Generate experiment name: env-model (clean env name)
+ENV_SHORT=$(echo $ENV_NAME | sed 's/-v0//' | tr '[:upper:]' '[:lower:]')
+EXP_NAME="${ENV_SHORT}-${MODEL_TYPE}"
 
 # Print job information
 echo "========================================"
-echo "GoNogo Training Job"
+echo "NeuroGym Training Job"
 echo "========================================"
 echo "Experiment: $EXP_NAME"
+echo "Environment: $ENV_NAME"
 echo "Model Type: $MODEL_TYPE"
-echo "Eta: $ETA"
-echo "Lambda: $LAMBDA"
 echo "Hidden Dim: $HIDDEN_DIM"
 echo "Num Layers: $NUM_LAYERS"
 echo "Total Frames: $TOTAL_FRAMES"
 echo "Max Episode Steps: $MAX_EPISODE_STEPS"
+echo "Learning Rate: $LEARNING_RATE"
 echo "----------------------------------------"
 echo "Start time: $(date)"
 echo "Hostname: $(hostname)"
@@ -46,7 +47,7 @@ source .venv/bin/activate
 echo "Starting training..."
 python main.py train-neurogym \
     --experiment-name ${EXP_NAME} \
-    --env-name GoNogo-v0 \
+    --env-name ${ENV_NAME} \
     --max-episode-steps ${MAX_EPISODE_STEPS} \
     --total-frames ${TOTAL_FRAMES} \
     --model-type ${MODEL_TYPE} \
@@ -68,6 +69,5 @@ echo "Training completed"
 echo "End time: $(date)"
 echo "Exit code: $EXIT_CODE"
 echo "========================================"
-
 
 exit $EXIT_CODE

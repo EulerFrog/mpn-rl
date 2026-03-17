@@ -8,6 +8,7 @@ Available metrics:
 - worst_vs_best: Worst and best episode rewards with gap
 
 Usage:
+    python compare_models.py --env-name GoNogo-v0 --metrics all --num-episodes 20
     python compare_models.py --experiments exp1 exp2 exp3 --num-episodes 10
     python compare_models.py --experiments exp1 exp2 --seeds 42 43 44 45 46
     python compare_models.py --experiments exp1 exp2 --metrics cumulative_reward parameter_count
@@ -16,26 +17,96 @@ Usage:
 
 import argparse
 import json
+import warnings
 import numpy as np
 import torch
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple, Any
 
 import neurogym  # Register neurogym environments
+import temporal_order_env  # Register TemporalOrder-v0 / TemporalOrder10-v0 / TemporalOrder20-v0
 
 from tensordict.nn import TensorDictModule as Mod
 from tensordict.nn import TensorDictSequential as Seq
 from torchrl.envs import (Compose, ExplorationType, InitTracker, StepCounter,
                           TransformedEnv, set_exploration_type)
 from torchrl.envs.libs.gym import GymEnv
-from torchrl.modules import MLP, QValueModule
+from torchrl.modules import MLP, LSTMModule, QValueModule
 
-from mpn_torchrl_module import MPNModule
+from mpn_torchrl_module import MPNModule, MPNPolyModule
 from rnn_module import RNNModule
 from model_utils import ExperimentManager
 
 
 AVAILABLE_METRICS = ['cumulative_reward', 'reward_variance', 'parameter_count', 'worst_vs_best']
+
+# Config keys excluded from varying hyperparameter detection
+EXCLUDED_HPARAM_KEYS = {
+    'experiment_name', 'experiment_id', 'command', 'tag', 'device',
+    'checkpoint_freq', 'max_checkpoints', 'print_freq',
+    'num_eval_episodes', 'num_envs', 'frames_per_batch',
+    'grad_clip', 'epsilon_end',
+    # Already fixed table columns
+    'model_type', 'num_layers', 'hidden_dim',
+    # Environment is the grouping key
+    'env_name',
+}
+
+
+def discover_experiments_by_env(env_name: str, base_dir: str = "experiments") -> List[str]:
+    """Scan experiments/ for all experiment dirs matching env_name with best_model.pt."""
+    base = Path(base_dir)
+    if not base.exists():
+        raise FileNotFoundError(f"Experiments directory not found: {base}")
+
+    matching = []
+    for exp_dir in sorted(base.iterdir()):
+        if not exp_dir.is_dir():
+            continue
+        config_path = exp_dir / "config.json"
+        if not config_path.exists():
+            continue
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if config.get('env_name') != env_name:
+            continue
+        checkpoint_path = exp_dir / "checkpoints" / "best_model.pt"
+        if not checkpoint_path.exists():
+            warnings.warn(f"Skipping {exp_dir.name}: no best_model.pt")
+            continue
+        matching.append(exp_dir.name)
+
+    return matching
+
+
+def detect_varying_hyperparameters(configs: Dict[str, Dict]) -> List[str]:
+    """Find config keys with >1 unique value across experiments, excluding metadata."""
+    if len(configs) < 2:
+        return []
+
+    # Collect all keys across configs
+    all_keys: Set[str] = set()
+    for config in configs.values():
+        all_keys.update(config.keys())
+
+    varying = []
+    for key in sorted(all_keys):
+        if key in EXCLUDED_HPARAM_KEYS:
+            continue
+        values = set()
+        for config in configs.values():
+            val = config.get(key)
+            # Make unhashable types hashable
+            if isinstance(val, (list, dict)):
+                val = json.dumps(val, sort_keys=True)
+            values.add(val)
+        if len(values) > 1:
+            varying.append(key)
+
+    return varying
 
 
 def create_eval_env(env_name: str, device: torch.device) -> TransformedEnv:
@@ -73,10 +144,52 @@ def build_mpn_policy(env: TransformedEnv, config: Dict, device: torch.device) ->
         mpn_layer = MPNModule(
             input_size=obs_dim if layer_idx == 0 else hidden_dim,
             hidden_size=hidden_dim,
-            eta=eta,
-            lambda_decay=lambda_decay,
             activation=activation,
             freeze_plasticity=freeze_plasticity,
+            device=device,
+            in_keys=in_keys,
+            out_keys=out_keys,
+        )
+        layers.append(mpn_layer)
+        env.append_transform(mpn_layer.make_tensordict_primer())
+
+    recurrent_module = Seq(*layers)
+
+    mlp = MLP(
+        out_features=action_dim,
+        num_cells=[hidden_dim],
+        device=device,
+    )
+    mlp[-1].bias.data.fill_(0.0)
+    mlp_module = Mod(mlp, in_keys=[f"embed_{num_layers-1}"], out_keys=["action_value"])
+
+    qval = QValueModule(spec=env.action_spec)
+
+    policy = Seq(recurrent_module, mlp_module, qval)
+    return policy
+
+
+def build_mpn_poly_policy(env: TransformedEnv, config: Dict, device: torch.device) -> Seq:
+    """Build MPNPoly policy architecture matching training setup."""
+    hidden_dim = config['hidden_dim']
+    num_layers = config.get('num_layers', 1)
+    activation = config.get('activation', 'tanh')
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    action_dim = env.action_spec.space.n
+
+    layers = []
+    for layer_idx in range(num_layers):
+        in_key = "observation" if layer_idx == 0 else f"embed_{layer_idx-1}"
+        out_key = f"embed_{layer_idx}"
+
+        in_keys = [in_key, f"recurrent_state_{layer_idx}"]
+        out_keys = [out_key, ("next", f"recurrent_state_{layer_idx}")]
+
+        mpn_layer = MPNPolyModule(
+            input_size=obs_dim if layer_idx == 0 else hidden_dim,
+            hidden_size=hidden_dim,
+            activation=activation,
             device=device,
             in_keys=in_keys,
             out_keys=out_keys,
@@ -137,6 +250,41 @@ def build_rnn_policy(env: TransformedEnv, config: Dict, device: torch.device) ->
     return policy
 
 
+def build_lstm_policy(env: TransformedEnv, config: Dict, device: torch.device) -> Seq:
+    """Build LSTM policy architecture matching training setup."""
+    hidden_dim = config['hidden_dim']
+    num_layers = config.get('num_layers', 1)
+
+    obs_dim = env.observation_spec["observation"].shape[-1]
+    action_dim = env.action_spec.space.n
+
+    lstm_module = LSTMModule(
+        input_size=obs_dim,
+        hidden_size=hidden_dim,
+        num_layers=num_layers,
+        device=device,
+        in_key="observation",
+        out_key=f"embed_{num_layers-1}",
+    )
+    env.append_transform(lstm_module.make_tensordict_primer())
+
+    # Wrap in Seq to match training structure
+    recurrent_module = Seq(lstm_module)
+
+    mlp = MLP(
+        out_features=action_dim,
+        num_cells=[hidden_dim],
+        device=device,
+    )
+    mlp[-1].bias.data.fill_(0.0)
+    mlp_module = Mod(mlp, in_keys=[f"embed_{num_layers-1}"], out_keys=["action_value"])
+
+    qval = QValueModule(spec=env.action_spec)
+
+    policy = Seq(recurrent_module, mlp_module, qval)
+    return policy
+
+
 def count_parameters(model: torch.nn.Module) -> int:
     """Count total trainable parameters in a model."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -164,6 +312,10 @@ def load_model_from_experiment(
     # Build policy based on type
     if model_type == 'rnn':
         policy = build_rnn_policy(env, config, device)
+    elif model_type == 'lstm':
+        policy = build_lstm_policy(env, config, device)
+    elif model_type == 'mpn-poly':
+        policy = build_mpn_poly_policy(env, config, device)
     else:
         policy = build_mpn_policy(env, config, device)
 
@@ -179,6 +331,25 @@ def load_model_from_experiment(
     return policy, env, config, model_type
 
 
+def seed_env(env: TransformedEnv, seed: int) -> None:
+    """Properly seed a TorchRL TransformedEnv and its underlying environment."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    # Access underlying gym environment and seed it directly
+    # TransformedEnv -> GymEnv -> gym.Env
+    try:
+        base_env = env.base_env
+        if hasattr(base_env, '_env'):
+            # GymEnv wraps the actual gym environment in _env
+            gym_env = base_env._env
+            if hasattr(gym_env, 'seed'):
+                gym_env.seed(seed)
+            if hasattr(gym_env, 'np_random'):
+                gym_env.np_random = np.random.default_rng(seed)
+    except Exception:
+        pass  # Fall back to just using reset(seed=seed)
+
+
 def evaluate_episode_torchrl(
     policy: Seq,
     env: TransformedEnv,
@@ -187,13 +358,13 @@ def evaluate_episode_torchrl(
 ) -> float:
     """Run a single evaluation episode using TorchRL."""
     if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+        seed_env(env, seed)
 
     total_reward = 0.0
 
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-        td = env.reset()
+        # Pass seed to environment reset for reproducibility
+        td = env.reset(seed=seed)
 
         for step in range(max_steps):
             td = policy(td)
@@ -220,14 +391,14 @@ def evaluate_random_episode_torchrl(
 ) -> float:
     """Run a single episode with random actions using TorchRL."""
     if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+        seed_env(env, seed)
 
     total_reward = 0.0
     action_dim = env.action_spec.space.n
     device = env.device
 
-    td = env.reset()
+    # Pass seed to environment reset for reproducibility
+    td = env.reset(seed=seed)
 
     for step in range(max_steps):
         action = torch.zeros(env.action_spec.shape, device=device)
@@ -321,7 +492,8 @@ def compare_models(
     num_episodes: int = 10,
     seeds: Optional[List[int]] = None,
     max_steps: int = 500,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    varying_hparams: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """Compare trained models on specified metrics."""
     eval_seeds = seeds if seeds is not None else list(range(42, 42 + num_episodes))
@@ -360,13 +532,20 @@ def compare_models(
 
     env_name = configs[experiment_names[0]]['env_name']
 
+    # Detect varying hyperparameters if not provided
+    if varying_hparams is None:
+        varying_hparams = detect_varying_hyperparameters(configs)
+    if varying_hparams:
+        print(f"Varying hyperparameters: {varying_hparams}")
+
     results = {
         "metadata": {
             "environment": env_name,
             "num_episodes": len(eval_seeds),
             "seeds": eval_seeds,
             "max_steps": max_steps,
-            "metrics_computed": metrics
+            "metrics_computed": metrics,
+            "varying_hyperparameters": varying_hparams
         },
         "models": {}
     }
@@ -391,6 +570,10 @@ def compare_models(
     random_metrics = compute_metrics(random_rewards, None, eval_seeds, metrics)
     random_metrics['model_type'] = 'random'
     random_metrics['hidden_dim'] = 0
+    random_metrics['num_layers'] = 0
+
+    if varying_hparams:
+        random_metrics['hyperparameters'] = {k: None for k in varying_hparams}
 
     if needs_episodes:
         random_metrics['episode_rewards'] = random_rewards
@@ -432,6 +615,10 @@ def compare_models(
         model_metrics = compute_metrics(episode_rewards, policy, eval_seeds, metrics)
         model_metrics['model_type'] = model_types[exp_name]
         model_metrics['hidden_dim'] = config['hidden_dim']
+        model_metrics['num_layers'] = config.get('num_layers', 1)
+
+        if varying_hparams:
+            model_metrics['hyperparameters'] = {k: config.get(k) for k in varying_hparams}
 
         if needs_episodes:
             model_metrics['episode_rewards'] = episode_rewards
@@ -465,17 +652,28 @@ def print_comparison_table(results: Dict[str, Any]):
     exp_names = list(models.keys())
     computed_metrics = results["metadata"]["metrics_computed"]
     num_episodes = results["metadata"]["num_episodes"]
+    varying_hparams = results["metadata"].get("varying_hyperparameters", [])
+
+    # Get random baseline mean for computing improvement
+    random_mean = None
+    if 'random' in models and 'cumulative_reward' in computed_metrics:
+        random_mean = models['random']['cumulative_reward']['mean']
 
     # Build header parts with their widths
-    header_parts = [f"{'Model':<25}", f"{'Type':<12}", f"{'Hidden':<8}"]
+    header_parts = [f"{'Model':<32}", f"{'Type':<12}", f"{'Layers':<8}", f"{'Hidden':<8}"]
+    # Dynamic columns for varying hyperparameters
+    for hp in varying_hparams:
+        col_width = max(len(hp), 10)
+        header_parts.append(f"{hp:<{col_width}}")
     if 'parameter_count' in computed_metrics:
         header_parts.append(f"{'Params':<12}")
     if 'cumulative_reward' in computed_metrics:
         header_parts.append(f"{'Mean':<10}")
         header_parts.append(f"{'Std':<10}")
-        header_parts.append(f"{'Median':<10}")
     if 'reward_variance' in computed_metrics:
         header_parts.append(f"{'Variance':<12}")
+    if 'cumulative_reward' in computed_metrics and random_mean is not None:
+        header_parts.append(f"{'vs Random':<12}")
     if 'worst_vs_best' in computed_metrics:
         header_parts.append(f"{'Best':<10}")
         header_parts.append(f"{'Worst':<10}")
@@ -493,8 +691,17 @@ def print_comparison_table(results: Dict[str, Any]):
 
     for exp_name in exp_names:
         m = models[exp_name]
+        layers_str = str(m.get('num_layers', 0)) if m.get('num_layers', 0) > 0 else "-"
         hidden_str = str(m.get('hidden_dim', 0)) if m.get('hidden_dim', 0) > 0 else "-"
-        row_parts = [f"{exp_name:<25}", f"{m['model_type']:<12}", f"{hidden_str:<8}"]
+        row_parts = [f"{exp_name:<32}", f"{m['model_type']:<12}", f"{layers_str:<8}", f"{hidden_str:<8}"]
+
+        # Dynamic columns for varying hyperparameters
+        hparams = m.get('hyperparameters', {})
+        for hp in varying_hparams:
+            col_width = max(len(hp), 10)
+            val = hparams.get(hp)
+            val_str = "-" if val is None else str(val)
+            row_parts.append(f"{val_str:<{col_width}}")
 
         if 'parameter_count' in computed_metrics:
             row_parts.append(f"{m['parameter_count']:<12,}")
@@ -502,9 +709,16 @@ def print_comparison_table(results: Dict[str, Any]):
             cr = m['cumulative_reward']
             row_parts.append(f"{cr['mean']:<10.2f}")
             row_parts.append(f"{cr['std']:<10.2f}")
-            row_parts.append(f"{cr['median']:<10.2f}")
         if 'reward_variance' in computed_metrics:
             row_parts.append(f"{m['reward_variance']:<12.2f}")
+        if 'cumulative_reward' in computed_metrics and random_mean is not None:
+            if exp_name == 'random':
+                row_parts.append(f"{'-':<12}")
+            else:
+                cr = m['cumulative_reward']
+                improvement = cr['mean'] - random_mean
+                pct = (improvement / abs(random_mean)) * 100 if random_mean != 0 else 0
+                row_parts.append(f"{pct:+.1f}%".ljust(12))
         if 'worst_vs_best' in computed_metrics:
             wb = m['worst_vs_best']
             row_parts.append(f"{wb['best']['reward']:<10.2f}")
@@ -550,6 +764,9 @@ def main():
 Available metrics: {', '.join(AVAILABLE_METRICS)}
 
 Examples:
+    # Compare all experiments for an environment
+    python compare_models.py --env-name GoNogo-v0 --metrics all
+
     # Compare with all metrics
     python compare_models.py --experiments exp1 exp2 exp3 --metrics all
 
@@ -564,9 +781,14 @@ Examples:
         """
     )
 
-    parser.add_argument(
-        '--experiments', type=str, nargs='+', required=True,
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
+        '--experiments', type=str, nargs='+',
         help='Experiment names to compare'
+    )
+    source_group.add_argument(
+        '--env-name', type=str,
+        help='Environment name to discover and compare all experiments for'
     )
     parser.add_argument(
         '--metrics', type=str, nargs='+', default=['all'],
@@ -595,6 +817,22 @@ Examples:
 
     args = parser.parse_args()
 
+    # Resolve experiment list
+    if args.env_name:
+        experiment_names = discover_experiments_by_env(args.env_name)
+        if not experiment_names:
+            print(f"No completed experiments found for environment: {args.env_name}")
+            return
+        print(f"Discovered {len(experiment_names)} experiments for {args.env_name}")
+    else:
+        experiment_names = args.experiments
+
+    # Auto-generate output path for --env-name when --output not specified
+    output_path = args.output
+    if output_path is None and args.env_name:
+        env_short = args.env_name.replace('-v0', '').lower()
+        output_path = f"condor/outputs/compare_{env_short}.json"
+
     if 'all' in args.metrics:
         metrics = AVAILABLE_METRICS
     else:
@@ -607,7 +845,7 @@ Examples:
             metrics.append(m)
 
     results = compare_models(
-        experiment_names=args.experiments,
+        experiment_names=experiment_names,
         metrics=metrics,
         num_episodes=args.num_episodes,
         seeds=args.seeds,
@@ -617,8 +855,9 @@ Examples:
 
     print_comparison_table(results)
 
-    if args.output:
-        output_path = Path(args.output)
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\nResults saved to: {output_path}")

@@ -20,6 +20,43 @@ import numpy as np
 from typing import Optional, Tuple
 
 
+class RandomInputProjection(nn.Module):
+    """
+    Fixed random input projection: x_out = W_rand @ x_in + b_rand
+
+    Implements the NeuroGym input expansion from eLife-83035 (Methods 5.1).
+    For low-dimensional inputs, projects to a higher-dimensional space so that
+    near-zero inputs still produce a non-trivial modulation-dependent response.
+
+    W_rand and b_rand are initialized with Xavier uniform initialization and
+    are fixed (not trained) during training — registered as buffers.
+
+    Args:
+        input_dim: Original input dimensionality (d')
+        output_dim: Projected dimensionality (d, default 10 in the paper)
+    """
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+
+        W = torch.empty(output_dim, input_dim)
+        b = torch.empty(output_dim)
+
+        nn.init.xavier_uniform_(W)
+        # Xavier uniform bound for the bias
+        bound = np.sqrt(6.0 / (input_dim + output_dim))
+        nn.init.uniform_(b, -bound, bound)
+
+        self.register_buffer('W_rand', W)
+        self.register_buffer('b_rand', b)
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.W_rand, self.b_rand)
+
+
 class MPNLayer(nn.Module):
     """
     Multi-Plasticity Network Layer with Hebbian learning.
@@ -31,10 +68,10 @@ class MPNLayer(nn.Module):
     Args:
         input_dim: Dimension of input features
         hidden_dim: Dimension of hidden layer (output of this layer)
-        eta: Learning rate for Hebbian plasticity (fixed)
-        lambda_decay: Decay factor for synaptic modulation matrix (fixed, 0 < λ ≤ 1)
         activation: Activation function ('relu', 'tanh', 'sigmoid', or 'linear')
         bias: Whether to use bias term
+        freeze_plasticity: Disable Hebbian updates
+        lambda_max: Maximum value for lambda clamping (default 0.99)
 
     Shape:
         - Input: (batch_size, input_dim)
@@ -47,19 +84,21 @@ class MPNLayer(nn.Module):
         self,
         input_dim: int,
         hidden_dim: int,
-        eta: float = 0.01,
-        lambda_decay: float = 0.95,
         activation: str = 'tanh',
         bias: bool = True,
         freeze_plasticity: bool = False,
+        lambda_max: float = 0.99,
     ):
         super().__init__()
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.eta = eta
-        self.lambda_decay = lambda_decay
         self.freeze_plasticity = freeze_plasticity
+        self.lambda_max = lambda_max
+
+        # Hebbian plasticity parameters (learnable via backprop)
+        self.eta = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
+        self._lambda_raw = nn.Parameter(torch.tensor(0.95, dtype=torch.float32))
 
         # Long-term synaptic weights (trainable via backprop)
         # Shape: [hidden_dim, input_dim]
@@ -160,10 +199,12 @@ class MPNLayer(nn.Module):
             h = self.activation(y_tilde)
 
             # Hebbian update: M_new = λ*M + η*h*x^T
+            # Clamp lambda to [0, lambda_max] for stability
             # h shape: [batch_size, hidden_dim, 1]
             # x shape: [batch_size, 1, input_dim]
             # h @ x^T: [batch_size, hidden_dim, input_dim]
-            M_new = self.lambda_decay * M + self.eta * torch.bmm(
+            lam = torch.clamp(self._lambda_raw, 0.0, self.lambda_max)
+            M_new = lam * M + self.eta * torch.bmm(
                 h.unsqueeze(2), x.unsqueeze(1)
             )
 
@@ -184,9 +225,9 @@ class MPN(nn.Module):
     Args:
         input_dim: Dimension of observations
         hidden_dim: Dimension of hidden layer
-        eta: Hebbian learning rate
-        lambda_decay: Decay factor for M matrix
         activation: Activation function for hidden layer
+        freeze_plasticity: Disable Hebbian updates
+        lambda_max: Maximum value for lambda clamping (default 0.99)
 
     Example:
         >>> mpn = MPN(input_dim=4, hidden_dim=64)
@@ -205,10 +246,9 @@ class MPN(nn.Module):
         self,
         input_dim: int,
         hidden_dim: int,
-        eta: float = 0.01,
-        lambda_decay: float = 0.95,
         activation: str = 'tanh',
         freeze_plasticity: bool = False,
+        lambda_max: float = 0.99,
     ):
         super().__init__()
 
@@ -220,11 +260,10 @@ class MPN(nn.Module):
         self.mpn_layer = MPNLayer(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
-            eta=eta,
-            lambda_decay=lambda_decay,
             activation=activation,
             bias=True,
-            freeze_plasticity=freeze_plasticity
+            freeze_plasticity=freeze_plasticity,
+            lambda_max=lambda_max,
         )
 
     def init_state(self, batch_size: int, device: Optional[torch.device] = None) -> torch.Tensor:
@@ -255,7 +294,7 @@ if __name__ == "__main__":
     print("Testing MPN module...")
 
     # Create MPN
-    mpn = MPN(input_dim=4, hidden_dim=8, eta=0.1, lambda_decay=0.9)
+    mpn = MPN(input_dim=4, hidden_dim=8)
 
     # Test single step
     batch_size = 2
@@ -279,3 +318,4 @@ if __name__ == "__main__":
         print(f"Step {t}: M matrix mean = {state.mean().item():.4f}, std = {state.std().item():.4f}")
 
     print("\nMPN module test completed!")
+

@@ -717,6 +717,22 @@ class ExperimentManager:
         checkpoints.sort(key=lambda p: int(p.stem.split('_')[1]))
         return str(checkpoints[-1])
 
+    def cleanup_checkpoints(self, max_checkpoints: int = 4):
+        """
+        Keep only the most recent periodic checkpoints, deleting older ones.
+        best_model.pt and final_model.pt are never deleted.
+
+        Args:
+            max_checkpoints: Maximum number of checkpoint_*.pt files to keep
+        """
+        checkpoints = list(self.checkpoint_dir.glob("checkpoint_*.pt"))
+        if len(checkpoints) <= max_checkpoints:
+            return
+        checkpoints.sort(key=lambda p: int(p.stem.split('_')[1]))
+        for old_ckpt in checkpoints[:-max_checkpoints]:
+            old_ckpt.unlink()
+            print(f"Removed old checkpoint: {old_ckpt.name}")
+
     def __repr__(self):
         return f"ExperimentManager('{self.experiment_name}', dir='{self.exp_dir}')"
 
@@ -854,14 +870,6 @@ if __name__ == "__main__":
     history = exp.load_training_history()
     print(f"History episodes: {history['episodes']}")
     print(f"History rewards: {history['rewards']}")
-
-    # Test model save (dummy model)
-    print("\nTesting model save...")
-    from mpn_dqn import MPNDQN
-    model = MPNDQN(obs_dim=4, hidden_dim=8, action_dim=2)
-    optimizer = torch.optim.Adam(model.parameters())
-
-    save_checkpoint(exp, model, optimizer, episode=100, avg_reward=150.0, is_best=True)
 
     print("\nExperimentManager test completed!")
     print(f"Check the '{exp.exp_dir}' directory to see generated files")

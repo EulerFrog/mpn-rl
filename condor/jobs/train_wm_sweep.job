@@ -1,0 +1,21 @@
+universe = vanilla
+executable = ./condor/scripts/train_wm_sweep.sh
+
+# Resource requests (GPU training, longer runs)
+request_cpus = 2
+request_gpus = 1
+request_memory = 12GB
+
+# Output files
+output = condor/logs/wm_sweep_$(Process).out
+error  = condor/logs/wm_sweep_$(Process).err
+log    = condor/logs/wm_sweep_$(Process).log
+
++CSCI_GrpDesktop = true
+
+max_materialize = 50
+
+# Pass arguments from args file
+# Format: ENV_NAME MODEL_TYPE LEARNING_RATE ETA LAMBDA_DECAY
+arguments = $(args)
+Queue args from condor/args/train_wm_sweep_args.txt
