@@ -94,6 +94,7 @@ class MPNModule(ModuleBase):
         out_key: Optional[str] = None,
         out_keys: Optional[list] = None,
         device: Optional[torch.device] = None,
+        default_recurrent_mode: bool | None = None,
     ):
         super().__init__()
 
@@ -176,16 +177,24 @@ class MPNModule(ModuleBase):
 
         # Store the actual MPN input dim for state shape
         self._mpn_input_dim = mpn_input_dim
+        self._recurrent_mode = default_recurrent_mode
 
         if device is not None:
             self.to(device)
 
     @property
     def recurrent_mode(self):
+        from torchrl.modules.tensordict_module.rnn import recurrent_mode
         rm = recurrent_mode()
         if rm is None:
-            return bool(self._default_recurrent_mode)
+            return bool(self._recurrent_mode)
         return rm
+
+    @recurrent_mode.setter
+    def recurrent_mode(self, value):
+        raise RuntimeError(
+            "recurrent_mode cannot be changed in-place. Please use the set_recurrent_mode context manager."
+        )
 
     @dispatch
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:

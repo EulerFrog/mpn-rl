@@ -869,7 +869,7 @@ def main():
     train_parser.add_argument('--grad-clip', type=float, default=10.0, help='Gradient clipping')
     train_parser.add_argument('--target-update-tau', type=float, default=0.95, help='Target network soft update tau')
     train_parser.add_argument('--checkpoint-freq', type=int, default=5000, help='Checkpoint frequency (frames)')
-    train_parser.add_argument('--max-checkpoints', type=int, default=2, help='Max periodic checkpoints to keep (oldest deleted)')
+    train_parser.add_argument('--max-checkpoints', type=int, default=1, help='Max periodic checkpoints to keep (oldest deleted)')
     train_parser.add_argument('--print-freq', type=int, default=500, help='Print and evaluation frequency (frames)')
     train_parser.add_argument('--num-eval-episodes', type=int, default=3, help='Number of evaluation episodes to average')
     train_parser.add_argument('--num-envs', type=int, default=1, help='Number of parallel training environments')
