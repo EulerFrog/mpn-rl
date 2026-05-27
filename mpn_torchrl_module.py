@@ -88,6 +88,8 @@ class MPNModule(ModuleBase):
         bias: bool = True,
         freeze_plasticity: bool = False,
         lambda_max: float = 0.99,
+        eta_init: float = 0.01,
+        lambda_init: float = 0.99,
         num_pre_layers: int = 0,
         in_key: Optional[str] = None,
         in_keys: Optional[list] = None,
@@ -173,6 +175,8 @@ class MPNModule(ModuleBase):
             bias=bias,
             freeze_plasticity=freeze_plasticity,
             lambda_max=lambda_max,
+            eta_init=eta_init,
+            lambda_init=lambda_init,
         )
 
         # Store the actual MPN input dim for state shape

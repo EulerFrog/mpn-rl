@@ -3,6 +3,7 @@ Custom TorchRL transform to extract NeuroGym GoNogo info (gt, new_trial) into te
 """
 
 import torch
+from torchrl.data.tensor_specs import BoundedDiscrete
 from torchrl.envs.transforms import Transform
 from tensordict import TensorDictBase
 
@@ -15,6 +16,24 @@ class NeuroGymInfoTransform(Transform):
 
     def __init__(self):
         super().__init__(in_keys=[], out_keys=["gt", "new_trial"])
+
+    def transform_observation_spec(self, observation_spec):
+        """Register gt and new_trial in the output spec so TorchRL can build rollouts.
+
+        gt range is inferred from the environment's action space so this works
+        for any NeuroGym environment where gt is always a valid action index.
+        """
+        device = observation_spec.device
+
+        # Infer number of possible gt values from the action spec
+        try:
+            n_gt = self.parent.action_spec.space.n
+        except Exception:
+            n_gt = 2  # safe fallback for binary environments
+
+        observation_spec["gt"] = BoundedDiscrete(low=0, high=n_gt, shape=(), dtype=torch.long, device=device)
+        observation_spec["new_trial"] = BoundedDiscrete(low=0, high=2, shape=(), dtype=torch.bool, device=device)
+        return observation_spec
 
     def _call(self, tensordict: TensorDictBase) -> TensorDictBase:
         """Called during forward pass (doesn't modify, just passes through)."""
@@ -64,7 +83,8 @@ class NeuroGymInfoTransform(Transform):
             # Fallback to trial dict
             gt = int(gym_env.unwrapped.trial['ground_truth'])
 
-        # Add to tensordict
+        # Add to tensordict (new_trial is always False at reset)
         tensordict_reset.set("gt", torch.tensor(gt, dtype=torch.long, device=tensordict_reset.device))
+        tensordict_reset.set("new_trial", torch.tensor(False, dtype=torch.bool, device=tensordict_reset.device))
 
         return tensordict_reset

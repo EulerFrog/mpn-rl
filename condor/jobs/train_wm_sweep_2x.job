@@ -1,5 +1,6 @@
 universe = vanilla
 executable = ./condor/scripts/train_wm_sweep_2x.sh
+initialdir = /research/harris/joe/mpn-rl
 
 # Resource requests (GPU training, longer runs)
 request_cpus = 2

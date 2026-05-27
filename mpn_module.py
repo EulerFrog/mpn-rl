@@ -87,7 +87,9 @@ class MPNLayer(nn.Module):
         activation: str = 'tanh',
         bias: bool = True,
         freeze_plasticity: bool = False,
-        lambda_max: float = 0.99,
+        lambda_max: float = 0.95,
+        eta_init: float = 0.01,
+        lambda_init: float = 0.99,
     ):
         super().__init__()
 
@@ -97,8 +99,11 @@ class MPNLayer(nn.Module):
         self.lambda_max = lambda_max
 
         # Hebbian plasticity parameters (learnable via backprop)
-        self.eta = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
-        self._lambda_raw = nn.Parameter(torch.tensor(0.95, dtype=torch.float32))
+        # Eta: Xavier-uniform init so it can start positive or negative (anti-Hebbian)
+        bound = np.sqrt(3.0)  # Xavier uniform for a scalar ~ U[-sqrt(3), sqrt(3)]
+        eta_val = np.random.uniform(-bound, bound) if eta_init is None else eta_init
+        self.eta = nn.Parameter(torch.tensor(eta_val, dtype=torch.float32))
+        self._lambda_raw = nn.Parameter(torch.tensor(lambda_init, dtype=torch.float32))
 
         # Long-term synaptic weights (trainable via backprop)
         # Shape: [hidden_dim, input_dim]
@@ -199,12 +204,11 @@ class MPNLayer(nn.Module):
             h = self.activation(y_tilde)
 
             # Hebbian update: M_new = λ*M + η*h*x^T
-            # Clamp lambda to [0, lambda_max] for stability
-            # h shape: [batch_size, hidden_dim, 1]
-            # x shape: [batch_size, 1, input_dim]
-            # h @ x^T: [batch_size, hidden_dim, input_dim]
-            lam = torch.clamp(self._lambda_raw, 0.0, self.lambda_max)
-            M_new = lam * M + self.eta * torch.bmm(
+            # Clamp lambda in-place (like the reference) so the parameter itself
+            # stays bounded — prevents gradients from blocking above lambda_max
+            with torch.no_grad():
+                self._lambda_raw.data.clamp_(0.0, self.lambda_max)
+            M_new = self._lambda_raw * M + self.eta * torch.bmm(
                 h.unsqueeze(2), x.unsqueeze(1)
             )
 
@@ -249,6 +253,9 @@ class MPN(nn.Module):
         activation: str = 'tanh',
         freeze_plasticity: bool = False,
         lambda_max: float = 0.99,
+        eta_init: float = 0.01,
+        lambda_init: float = 0.99,
+        bias: bool = True,
     ):
         super().__init__()
 
@@ -261,9 +268,11 @@ class MPN(nn.Module):
             input_dim=input_dim,
             hidden_dim=hidden_dim,
             activation=activation,
-            bias=True,
+            bias=bias,
             freeze_plasticity=freeze_plasticity,
             lambda_max=lambda_max,
+            eta_init=eta_init,
+            lambda_init=lambda_init,
         )
 
     def init_state(self, batch_size: int, device: Optional[torch.device] = None) -> torch.Tensor:

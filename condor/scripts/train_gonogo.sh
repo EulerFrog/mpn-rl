@@ -14,10 +14,10 @@ NUM_LAYERS=$5
 TOTAL_FRAMES=$6
 MAX_EPISODE_STEPS=$7
 LEARNING_RATE=$8
-SUFFIX=$9    # suffix (e.g., "spicy_layer1")
+UTD=$9       # updates-to-data ratio (e.g., 1, 4, 16)
 
-# Generate experiment name: gonogo-model-verb-noun
-EXP_NAME="gonogo-${MODEL_TYPE}-${SUFFIX}"
+# Generate experiment name
+EXP_NAME="gonogo-${MODEL_TYPE}-utd${UTD}"
 
 # Print job information
 echo "========================================"
@@ -31,6 +31,7 @@ echo "Hidden Dim: $HIDDEN_DIM"
 echo "Num Layers: $NUM_LAYERS"
 echo "Total Frames: $TOTAL_FRAMES"
 echo "Max Episode Steps: $MAX_EPISODE_STEPS"
+echo "UTD: $UTD"
 echo "----------------------------------------"
 echo "Start time: $(date)"
 echo "Hostname: $(hostname)"
@@ -52,12 +53,21 @@ python main.py train-neurogym \
     --model-type ${MODEL_TYPE} \
     --hidden-dim ${HIDDEN_DIM} \
     --num-layers ${NUM_LAYERS} \
+    --eta-init ${ETA} \
+    --lambda-init ${LAMBDA} \
     --learning-rate ${LEARNING_RATE} \
     --device gpu \
     --buffer-size 20000 \
     --num-eval-episodes 10 \
+    --utd ${UTD} \
+    --target-update-tau 0.005 \
+    --epsilon-start 1.0 \
+    --epsilon-end 0.01 \
+    --sequence-len 15 \
+    --frames-per-batch 15 \
     --wandb \
-    --wandb-project mpn-rl
+    --wandb-project mpn-rl \
+    --tag gonogo-trial-aligned
 
 # Check exit status
 EXIT_CODE=$?

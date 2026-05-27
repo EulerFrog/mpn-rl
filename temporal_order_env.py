@@ -13,9 +13,10 @@ Observation: [s1, s2, cue]  (3-dimensional)
 Actions:     0 = S1 appeared first,  1 = S2 appeared first
 Reward:      +1 correct at response step, -1 wrong, 0 everywhere else
 
-Episode structure: continuous — many trials run back-to-back until
-StepCounter truncates the episode. Trial boundaries are signalled via
-info['new_trial'] for compatibility with NeuroGymInfoWrapper.
+Episode structure: one trial per episode — the episode terminates (terminated=True)
+at the response step. The environment resets for the next episode. This ensures
+each episode is a self-contained sequence of length trial_len, enabling clean
+sequence-aligned replay buffer sampling.
 """
 
 import numpy as np
@@ -98,19 +99,15 @@ class TemporalOrderEnv(gym.Env):
         if is_response:
             gt = self.trial["ground_truth"]
             reward = 1.0 if int(action) == gt else -1.0
-        else:
-            reward = 0.0
+            # Episode terminates — one trial per episode
+            obs = np.zeros(3, dtype=np.float32)
+            info = {"gt": gt, "new_trial": True}
+            return obs, reward, True, False, info
 
+        reward = 0.0
         self._t_in_trial += 1
-        new_trial = self._t_in_trial >= self.trial_len
-
-        if new_trial:
-            self._new_trial()
-
         obs = self._obs_array[self._t_in_trial].copy()
-        info = {"gt": self.trial["ground_truth"], "new_trial": new_trial}
-
-        # Episode never terminates — StepCounter handles truncation
+        info = {"gt": self.trial["ground_truth"], "new_trial": False}
         return obs, reward, False, False, info
 
 
@@ -224,17 +221,15 @@ class TemporalOrderRandEnv(gym.Env):
         if is_response:
             gt = self.trial["ground_truth"]
             reward = 1.0 if int(action) == gt else -1.0
-        else:
-            reward = 0.0
+            # Episode terminates — one trial per episode
+            obs = np.zeros(self.obs_dim, dtype=np.float32)
+            info = {"gt": gt, "new_trial": True}
+            return obs, reward, True, False, info
 
+        reward = 0.0
         self._t_in_trial += 1
-        new_trial = self._t_in_trial >= self.trial_len
-
-        if new_trial:
-            self._new_trial()
-
         obs = self._obs_array[self._t_in_trial].copy()
-        info = {"gt": self.trial["ground_truth"], "new_trial": new_trial}
+        info = {"gt": self.trial["ground_truth"], "new_trial": False}
         return obs, reward, False, False, info
 
 

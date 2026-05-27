@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Dict, Optional, Any
 import random
 from datetime import datetime
+import sqlite3
+import time
 from collections import deque, namedtuple
 
 
@@ -551,6 +553,63 @@ def generate_experiment_name() -> str:
     return f"{adj}-{noun}"
 
 
+SCHEMA_VERSION = 1
+EXPERIMENTS_DB = Path("experiments/experiments.sqlite")
+
+
+def _get_db() -> sqlite3.Connection:
+    """Open (or create) the SQLite experiments DB with WAL mode.
+
+    Note: the DB is an index only — JSON files in each experiment directory
+    are the source of truth.  DB writes are best-effort: if the filesystem
+    doesn't support SQLite locking (e.g. NFS), writes fail silently and the
+    JSON files remain intact.  Run `python query_experiments.py backfill` on
+    the head node to rebuild the index from JSON at any time.
+    """
+    EXPERIMENTS_DB.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(EXPERIMENTS_DB), timeout=60)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=60000")   # 60 s auto-retry on lock
+    con.execute("PRAGMA synchronous=NORMAL")   # safe + faster than FULL
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS experiments (
+            experiment_name TEXT PRIMARY KEY,
+            schema_version  INTEGER NOT NULL,
+            created_at      TEXT NOT NULL,
+            completed       INTEGER NOT NULL DEFAULT 0,
+            config          TEXT NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS training_history (
+            experiment_name TEXT NOT NULL,
+            schema_version  INTEGER NOT NULL,
+            frame           INTEGER NOT NULL,
+            episode         INTEGER,
+            reward          REAL,
+            length          INTEGER,
+            loss            REAL,
+            epsilon         REAL,
+            oracle_reward   REAL,
+            pct_oracle      REAL,
+            PRIMARY KEY (experiment_name, frame)
+        )
+    """)
+    con.commit()
+    return con
+
+
+def _try_db_write(fn):
+    """Call fn() which performs a DB write; silently ignore any DB errors.
+
+    Training must not crash due to DB issues — JSON files are the real record.
+    """
+    try:
+        fn()
+    except Exception:
+        pass
+
+
 class ExperimentManager:
     """
     Manages experiment directory structure and file I/O.
@@ -591,12 +650,23 @@ class ExperimentManager:
             dir_path.mkdir(parents=True, exist_ok=True)
 
         self.config_path = self.exp_dir / "config.json"
-        self.history_path = self.exp_dir / "training_history.json"
+        self.metrics_path = self.exp_dir / "metrics.jsonl"
 
     def save_config(self, config: Dict[str, Any]):
         """Save experiment configuration."""
+        created_at = datetime.now().isoformat()
+        config = {**config, "schema_version": SCHEMA_VERSION, "created_at": created_at}
         with open(self.config_path, 'w') as f:
             json.dump(config, f, indent=2)
+        def _write():
+            con = _get_db()
+            con.execute("""
+                INSERT OR REPLACE INTO experiments (experiment_name, schema_version, created_at, config)
+                VALUES (?, ?, ?, ?)
+            """, (self.experiment_name, SCHEMA_VERSION, created_at, json.dumps(config)))
+            con.commit()
+            con.close()
+        _try_db_write(_write)
         print(f"Saved config to {self.config_path}")
 
     def load_config(self) -> Dict[str, Any]:
@@ -668,40 +738,45 @@ class ExperimentManager:
         print(f"Loaded checkpoint from {checkpoint_path}")
         return checkpoint.get('metadata', {})
 
-    def save_training_history(self, history: Dict[str, list]):
-        """Save training history (rewards, losses, etc.)."""
-        with open(self.history_path, 'w') as f:
-            json.dump(history, f, indent=2)
-
-    def load_training_history(self) -> Dict[str, list]:
-        """Load training history."""
-        if not self.history_path.exists():
-            return {
-                'frames': [],
-                'rewards': [],
-                'lengths': [],
-                'losses': [],
-                'epsilons': [],
-            }
-        with open(self.history_path, 'r') as f:
-            history = json.load(f)
-            # Ensure 'frames' field exists for backward compatibility with old 'episodes' format
-            if 'frames' not in history and 'episodes' in history:
-                history['frames'] = history['episodes']
-            if 'frames' not in history:
-                history['frames'] = []
-            return history
-
     def append_training_history(self, frames: int, reward: float,
-                                length: int, loss: float, epsilon: float):
-        """Append new data to training history."""
-        history = self.load_training_history()
-        history['frames'].append(frames)
-        history['rewards'].append(reward)
-        history['lengths'].append(length)
-        history['losses'].append(loss)
-        history['epsilons'].append(epsilon)
-        self.save_training_history(history)
+                                length: int, loss: float, epsilon: float,
+                                oracle_reward: float = None, pct_oracle: float = None,
+                                episode: int = None):
+        """Append a single eval step to metrics.jsonl and the DB."""
+        with open(self.metrics_path, 'a') as f:
+            f.write(json.dumps({
+                'experiment_name': self.experiment_name,
+                'frame': int(frames),
+                'episode': int(episode) if episode is not None else None,
+                'reward': float(reward),
+                'length': int(length), 'loss': float(loss), 'epsilon': float(epsilon),
+                'oracle_reward': float(oracle_reward) if oracle_reward is not None else None,
+                'pct_oracle': float(pct_oracle) if pct_oracle is not None else None,
+            }) + '\n')
+        def _write():
+            con = _get_db()
+            con.execute("""
+                INSERT OR REPLACE INTO training_history
+                    (experiment_name, schema_version, frame, episode, reward, length, loss, epsilon,
+                     oracle_reward, pct_oracle)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (self.experiment_name, SCHEMA_VERSION, frames, episode, reward, length, loss,
+                  epsilon, oracle_reward, pct_oracle))
+            con.commit()
+            con.close()
+        _try_db_write(_write)
+
+    def mark_completed(self):
+        """Mark this experiment as completed in the DB."""
+        def _write():
+            con = _get_db()
+            con.execute(
+                "UPDATE experiments SET completed = 1 WHERE experiment_name = ?",
+                (self.experiment_name,)
+            )
+            con.commit()
+            con.close()
+        _try_db_write(_write)
 
     def get_best_checkpoint(self) -> Optional[str]:
         """Get path to best model checkpoint."""
@@ -862,14 +937,6 @@ if __name__ == "__main__":
     exp.save_config(config)
     loaded_config = exp.load_config()
     print(f"Loaded config: {loaded_config}")
-
-    # Test history
-    print("\nTesting history...")
-    for ep in range(5):
-        exp.append_training_history(ep, ep*10, ep*5, 0.1, 0.9)
-    history = exp.load_training_history()
-    print(f"History episodes: {history['episodes']}")
-    print(f"History rewards: {history['rewards']}")
 
     print("\nExperimentManager test completed!")
     print(f"Check the '{exp.exp_dir}' directory to see generated files")

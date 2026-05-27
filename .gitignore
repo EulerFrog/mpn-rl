@@ -72,6 +72,5 @@ test_*.png
 dummy_*.result.txt
 
 .claude
-condor
 *.zip
 .env

@@ -39,3 +39,4 @@ class NeuroGymInfoWrapper(gym.Wrapper):
         self._current_trial_gt = self.env.unwrapped.trial.get('ground_truth', None)
         self._last_info = info
         return obs, info
+

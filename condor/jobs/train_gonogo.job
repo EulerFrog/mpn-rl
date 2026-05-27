@@ -1,5 +1,6 @@
 universe = vanilla
 executable = ./condor/scripts/train_gonogo.sh
+initialdir = /research/harris/joe/mpn-rl
 
 # Resource requests (GPU training)
 request_cpus = 2
