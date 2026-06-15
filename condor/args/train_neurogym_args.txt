@@ -1,19 +1,15 @@
 ContextDecisionMaking-v0 mpn 128 50000
 ContextDecisionMaking-v0 mpn-frozen 128 50000
 ContextDecisionMaking-v0 mpn-poly 128 50000
-
 DelayComparison-v0 mpn 128 50000
 DelayComparison-v0 mpn-frozen 128 50000
 DelayComparison-v0 mpn-poly 128 50000
-
 DelayMatchSample-v0 mpn 128 50000
 DelayMatchSample-v0 mpn-frozen 128 50000
 DelayMatchSample-v0 mpn-poly 128 50000
-
 DelayMatchSampleDistractor1D-v0 mpn 128 50000
 DelayMatchSampleDistractor1D-v0 mpn-frozen 128 50000
 DelayMatchSampleDistractor1D-v0 mpn-poly 128 50000
-
 DelayPairedAssociation-v0 mpn 128 50000
 DelayPairedAssociation-v0 mpn-frozen 128 50000
 DelayPairedAssociation-v0 mpn-poly 128 50000

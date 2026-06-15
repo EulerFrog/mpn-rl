@@ -1,0 +1,19 @@
+universe = vanilla
+executable = ./condor/scripts/train_a2c_run1.sh
+initialdir = /research/harris/joe/mpn-rl
+
+request_cpus = 2
+request_gpus = 1
+request_memory = 8GB
+
+output = condor/logs/a2c_run1_$(Process).out
+error  = condor/logs/a2c_run1_$(Process).err
+log    = condor/logs/a2c_run1_$(Process).log
+
++CSCI_GrpDesktop = true
+
+max_materialize = 50
+
+# Format: ENV_NAME MODEL_TYPE HIDDEN_DIM TOTAL_FRAMES
+arguments = $(args)
+Queue args from condor/args/train_a2c_run1_args.txt

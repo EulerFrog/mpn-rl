@@ -74,3 +74,10 @@ dummy_*.result.txt
 .claude
 *.zip
 .env
+
+# Reference repos (embedded git repos, not submodules)
+mpn_reference/
+RL-with-scale-invariant-memory/
+RL-scale-invarient-memory-modified/
+old/
+workspace.code-workspace

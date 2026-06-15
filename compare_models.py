@@ -33,7 +33,7 @@ from torchrl.envs import (Compose, ExplorationType, InitTracker, StepCounter,
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.modules import MLP, LSTMModule, QValueModule
 
-from mpn_torchrl_module import MPNModule, MPNPolyModule
+from mpn_torchrl_module import MPNModule
 from rnn_module import RNNModule
 from model_utils import ExperimentManager
 
@@ -169,50 +169,6 @@ def build_mpn_policy(env: TransformedEnv, config: Dict, device: torch.device) ->
     return policy
 
 
-def build_mpn_poly_policy(env: TransformedEnv, config: Dict, device: torch.device) -> Seq:
-    """Build MPNPoly policy architecture matching training setup."""
-    hidden_dim = config['hidden_dim']
-    num_layers = config.get('num_layers', 1)
-    activation = config.get('activation', 'tanh')
-
-    obs_dim = env.observation_spec["observation"].shape[-1]
-    action_dim = env.action_spec.space.n
-
-    layers = []
-    for layer_idx in range(num_layers):
-        in_key = "observation" if layer_idx == 0 else f"embed_{layer_idx-1}"
-        out_key = f"embed_{layer_idx}"
-
-        in_keys = [in_key, f"recurrent_state_{layer_idx}"]
-        out_keys = [out_key, ("next", f"recurrent_state_{layer_idx}")]
-
-        mpn_layer = MPNPolyModule(
-            input_size=obs_dim if layer_idx == 0 else hidden_dim,
-            hidden_size=hidden_dim,
-            activation=activation,
-            device=device,
-            in_keys=in_keys,
-            out_keys=out_keys,
-        )
-        layers.append(mpn_layer)
-        env.append_transform(mpn_layer.make_tensordict_primer())
-
-    recurrent_module = Seq(*layers)
-
-    mlp = MLP(
-        out_features=action_dim,
-        num_cells=[hidden_dim],
-        device=device,
-    )
-    mlp[-1].bias.data.fill_(0.0)
-    mlp_module = Mod(mlp, in_keys=[f"embed_{num_layers-1}"], out_keys=["action_value"])
-
-    qval = QValueModule(spec=env.action_spec)
-
-    policy = Seq(recurrent_module, mlp_module, qval)
-    return policy
-
-
 def build_rnn_policy(env: TransformedEnv, config: Dict, device: torch.device) -> Seq:
     """Build RNN policy architecture matching training setup."""
     hidden_dim = config['hidden_dim']
@@ -314,8 +270,6 @@ def load_model_from_experiment(
         policy = build_rnn_policy(env, config, device)
     elif model_type == 'lstm':
         policy = build_lstm_policy(env, config, device)
-    elif model_type == 'mpn-poly':
-        policy = build_mpn_poly_policy(env, config, device)
     else:
         policy = build_mpn_policy(env, config, device)
 

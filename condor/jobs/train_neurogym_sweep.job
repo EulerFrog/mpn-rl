@@ -1,0 +1,19 @@
+universe = vanilla
+executable = ./condor/scripts/train_neurogym_sweep.sh
+initialdir = /research/harris/joe/mpn-rl
+
+request_cpus   = 2
+request_gpus   = 1
+request_memory = 8GB
+
+output = condor/logs/ng_sweep_$(Process).out
+error  = condor/logs/ng_sweep_$(Process).err
+log    = condor/logs/ng_sweep_$(Process).log
+
++CSCI_GrpDesktop = true
+
+max_materialize = 50
+
+# Format: ENV_NAME MODEL_TYPE NUM_LAYERS HIDDEN_DIM LEARNING_RATE
+arguments = $(args)
+Queue args from condor/args/train_neurogym_sweep_args.txt

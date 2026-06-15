@@ -1,0 +1,43 @@
+ContextDecisionMaking-v0 mpn 128 100000
+ContextDecisionMaking-v0 lstm 128 100000
+ContextDecisionMaking-v0 rnn 128 100000
+
+DelayComparison-v0 mpn 128 100000
+DelayComparison-v0 lstm 128 100000
+DelayComparison-v0 rnn 128 100000
+
+DelayMatchSample-v0 mpn 128 100000
+DelayMatchSample-v0 lstm 128 100000
+DelayMatchSample-v0 rnn 128 100000
+
+DelayMatchSampleDistractor1D-v0 mpn 128 100000
+DelayMatchSampleDistractor1D-v0 lstm 128 100000
+DelayMatchSampleDistractor1D-v0 rnn 128 100000
+
+DelayPairedAssociation-v0 mpn 128 100000
+DelayPairedAssociation-v0 lstm 128 100000
+DelayPairedAssociation-v0 rnn 128 100000
+
+GoNogo-v0 mpn 128 100000
+GoNogo-v0 lstm 128 100000
+GoNogo-v0 rnn 128 100000
+
+IntervalDiscrimination-v0 mpn 128 100000
+IntervalDiscrimination-v0 lstm 128 100000
+IntervalDiscrimination-v0 rnn 128 100000
+
+MultiSensoryIntegration-v0 mpn 128 100000
+MultiSensoryIntegration-v0 lstm 128 100000
+MultiSensoryIntegration-v0 rnn 128 100000
+
+PerceptualDecisionMaking-v0 mpn 128 100000
+PerceptualDecisionMaking-v0 lstm 128 100000
+PerceptualDecisionMaking-v0 rnn 128 100000
+
+PerceptualDecisionMakingDelayResponse-v0 mpn 128 100000
+PerceptualDecisionMakingDelayResponse-v0 lstm 128 100000
+PerceptualDecisionMakingDelayResponse-v0 rnn 128 100000
+
+ProbabilisticReasoning-v0 mpn 128 100000
+ProbabilisticReasoning-v0 lstm 128 100000
+ProbabilisticReasoning-v0 rnn 128 100000
